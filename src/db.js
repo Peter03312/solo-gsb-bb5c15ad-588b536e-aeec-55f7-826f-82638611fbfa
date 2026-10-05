@@ -1142,6 +1142,129 @@ export function cancelActiveScheduleByReservation(db, reservationId, nowIso) {
   return info.changes === 1 ? getScheduleRow(db, active.id) : null;
 }
 
+// ---------- 工作台：有界键集翻页（旧记录按稳定顺序逐页取回） ----------
+//
+// 所有历史表均为只追加（无删除）：排序统一固定为「按 id 倒序」（id 为单调自增主键）。
+// 翻页游标为上一页最后一条记录的 id，服务端只取 id < cursor 的行。由于 id 单调自增，
+// 同一轮翻页期间即使插入新记录（id 更大），本轮开始前已存在的记录也不会被重复取回
+// 或遗漏；新记录在重新取首页（刷新）后即可见。每页大小有界（limit + 1 判定是否有下一页）。
+
+export function listPublicationsPage(db, { beforeId = null, limit } = {}) {
+  return beforeId == null
+    ? db
+        .prepare(
+          `SELECT id, created_at, basis_hash, feasible, weight_count, diff_sum, reasons
+             FROM publications ORDER BY id DESC LIMIT ?`,
+        )
+        .all(limit + 1)
+    : db
+        .prepare(
+          `SELECT id, created_at, basis_hash, feasible, weight_count, diff_sum, reasons
+             FROM publications WHERE id < ? ORDER BY id DESC LIMIT ?`,
+        )
+        .all(beforeId, limit + 1);
+}
+
+export function listVerificationRowsPage(db, { beforeId = null, limit } = {}) {
+  const sql = (where) =>
+    `SELECT v.*, p.basis_hash AS pub_basis_hash, p.feasible AS pub_feasible
+       FROM verifications v
+       JOIN publications p ON p.id = v.publication_id
+      ${where}
+      ORDER BY v.id DESC LIMIT ?`;
+  return beforeId == null
+    ? db.prepare(sql('')).all(limit + 1)
+    : db.prepare(sql('WHERE v.id < ?')).all(beforeId, limit + 1);
+}
+
+export function listReservationRowsPage(db, { beforeId = null, limit } = {}) {
+  const sql = (where) =>
+    `SELECT r.*, p.basis_hash AS pub_basis_hash, p.feasible AS pub_feasible
+       FROM reservations r
+       JOIN publications p ON p.id = r.publication_id
+      ${where}
+      ORDER BY r.id DESC LIMIT ?`;
+  return beforeId == null
+    ? db.prepare(sql('')).all(limit + 1)
+    : db.prepare(sql('WHERE r.id < ?')).all(beforeId, limit + 1);
+}
+
+export function listSuspensionRowsPage(db, { beforeId = null, limit } = {}) {
+  return beforeId == null
+    ? db.prepare(`SELECT * FROM suspensions ORDER BY id DESC LIMIT ?`).all(limit + 1)
+    : db
+        .prepare(`SELECT * FROM suspensions WHERE id < ? ORDER BY id DESC LIMIT ?`)
+        .all(beforeId, limit + 1);
+}
+
+export function listRunRowsPage(db, { beforeId = null, limit } = {}) {
+  return beforeId == null
+    ? db.prepare(`SELECT * FROM runs ORDER BY id DESC LIMIT ?`).all(limit + 1)
+    : db
+        .prepare(`SELECT * FROM runs WHERE id < ? ORDER BY id DESC LIMIT ?`)
+        .all(beforeId, limit + 1);
+}
+
+export function listMaintenanceRowsPage(db, { beforeId = null, limit } = {}) {
+  return beforeId == null
+    ? db.prepare(`SELECT * FROM maintenances ORDER BY id DESC LIMIT ?`).all(limit + 1)
+    : db
+        .prepare(`SELECT * FROM maintenances WHERE id < ? ORDER BY id DESC LIMIT ?`)
+        .all(beforeId, limit + 1);
+}
+
+export function listCalibrationRowsPage(db, { beforeId = null, limit } = {}) {
+  return beforeId == null
+    ? db.prepare(`SELECT * FROM calibrations ORDER BY id DESC LIMIT ?`).all(limit + 1)
+    : db
+        .prepare(`SELECT * FROM calibrations WHERE id < ? ORDER BY id DESC LIMIT ?`)
+        .all(beforeId, limit + 1);
+}
+
+export function listItemRowsPage(db, { beforeId = null, limit } = {}) {
+  return beforeId == null
+    ? db.prepare(`SELECT * FROM weight_items ORDER BY id DESC LIMIT ?`).all(limit + 1)
+    : db
+        .prepare(`SELECT * FROM weight_items WHERE id < ? ORDER BY id DESC LIMIT ?`)
+        .all(beforeId, limit + 1);
+}
+
+export function listCheckoutRowsPage(db, { beforeId = null, limit } = {}) {
+  return beforeId == null
+    ? db.prepare(`SELECT * FROM checkouts ORDER BY id DESC LIMIT ?`).all(limit + 1)
+    : db
+        .prepare(`SELECT * FROM checkouts WHERE id < ? ORDER BY id DESC LIMIT ?`)
+        .all(beforeId, limit + 1);
+}
+
+export function listScheduleRowsPage(db, { beforeId = null, status = null, limit } = {}) {
+  const where = [];
+  const params = [];
+  if (status) {
+    where.push('status = ?');
+    params.push(status);
+  }
+  if (beforeId != null) {
+    where.push('id < ?');
+    params.push(beforeId);
+  }
+  params.push(limit + 1);
+  return db
+    .prepare(
+      `SELECT * FROM schedules ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+       ORDER BY id DESC LIMIT ?`,
+    )
+    .all(...params);
+}
+
+export function listBookingRowsPage(db, { beforeId = null, limit } = {}) {
+  return beforeId == null
+    ? db.prepare(`SELECT * FROM bookings ORDER BY id DESC LIMIT ?`).all(limit + 1)
+    : db
+        .prepare(`SELECT * FROM bookings WHERE id < ? ORDER BY id DESC LIMIT ?`)
+        .all(beforeId, limit + 1);
+}
+
 // ---------- 找时段预约（预约 + 排班整次操作；由 server 在单事务内调用） ----------
 
 export function getBookingRow(db, id) {

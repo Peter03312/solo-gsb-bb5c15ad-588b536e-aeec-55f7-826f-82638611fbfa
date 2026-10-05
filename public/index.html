@@ -13,6 +13,7 @@
   </header>
 
   <div id="alert" class="alert hidden"></div>
+  <div id="ov-bar" class="wb-banner hidden"></div>
 
   <main>
     <section class="card" id="sec-config">
@@ -126,6 +127,7 @@
     <section class="card" id="sec-pubs">
       <h2>7. 已发布装载图</h2>
       <div id="pub-list"></div>
+      <div id="publications-bar" class="wb-bar"></div>
     </section>
 
     <section class="card" id="sec-verify">
@@ -135,6 +137,7 @@
         空孔保持为空、质量 0。可随时暂存并恢复；同一发布记录只保留一份未完成核验。
       </div>
       <div id="verify-list"></div>
+      <div id="verifications-bar" class="wb-bar"></div>
     </section>
 
     <section class="card" id="sec-reserve">
@@ -164,6 +167,7 @@
       <div id="res-conflict"></div>
       <h3>预约列表</h3>
       <div id="res-list"></div>
+      <div id="reservations-bar" class="wb-bar"></div>
       <h3>占用日程（按当前库存判定；停用与「占用+停用」不足分区段展示）</h3>
       <div id="res-schedule"></div>
     </section>
@@ -200,6 +204,7 @@
       <div id="sus-conflict"></div>
       <h3>停用记录（含已撤销历史）</h3>
       <div id="sus-list"></div>
+      <div id="suspensions-bar" class="wb-bar"></div>
     </section>
 
     <section class="card" id="sec-runs">
@@ -235,6 +240,7 @@
       <div id="run-conflict"></div>
       <h3>运行列表（含运行状态、超时标记与冻结依据）</h3>
       <div id="run-list"></div>
+      <div id="runs-bar" class="wb-bar"></div>
     </section>
 
     <section class="card" id="sec-calib">
@@ -273,6 +279,7 @@
       <div id="calib-conflict"></div>
       <h3>校准记录（按校准时间倒序，只追加）</h3>
       <div id="calib-list"></div>
+      <div id="calibrations-bar" class="wb-bar"></div>
     </section>
 
     <section class="card" id="sec-maint">
@@ -319,6 +326,7 @@
       <div id="maint-conflict"></div>
       <h3>保养记录</h3>
       <div id="maint-list"></div>
+      <div id="maintenances-bar" class="wb-bar"></div>
       <datalist id="known-devices"></datalist>
     </section>
   </main>

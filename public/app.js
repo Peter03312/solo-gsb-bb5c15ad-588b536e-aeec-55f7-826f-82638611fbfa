@@ -1,4 +1,14 @@
 /* 离心转子配平前端（无框架，原生 JS） */
+/*
+ * 工作台读取链路（历史逐年累积后的分页模型）：
+ *   - GET /api/workbench/overview            当前配置/指纹/草稿 + 可执行状态
+ *     （当前可用发布图、已完成核验、生效预约、设备状态），按读取时现状计算；
+ *   - GET /api/workbench/history/:section    各历史区块首个有界页 / beforeId 翻页，
+ *     固定按 id 倒序；同一轮翻页以 nextBeforeId 稳定逐页取回，翻页期间新插入的
+ *     记录不会让本轮已有记录重复或遗漏，新记录在重新取首页（写入后刷新）后可见；
+ *   - 详情（发布快照、核验录入、运行冻结依据）仍按需调用各自的详情接口。
+ * 各区块独立加载：一个区块失败只显示该区的「重试」，其他区块与未提交编辑保持可用。
+ */
 
 const $ = (sel) => document.querySelector(sel);
 const holesSel = $('#holes');
@@ -9,8 +19,11 @@ for (let n = 4; n <= 12; n += 2) {
   holesSel.appendChild(opt);
 }
 
-let state = null; // GET /api/state 的完整响应
-// 编辑区本地缓冲
+// 当前配置 + 可执行状态（GET /api/workbench/overview 的响应）
+let ov = null;
+let ovStatus = 'loading'; // loading | ready | error
+let ovError = null;
+// 编辑区本地缓冲（区块读取失败或刷新期间不被清空，未提交编辑始终保留）
 let editorN = null;
 let tubeRows = []; // {id, mass, holes:Set}
 let weightRows = []; // {mass, quantity}
@@ -46,40 +59,214 @@ async function api(method, url, body) {
 }
 const fmt = (x) => (typeof x === 'number' ? String(Math.round(x * 1e6) / 1e6) : x);
 
-// ---------- 数据刷新 ----------
-
-async function refresh(flash) {
-  state = await api('GET', '/api/state');
-  renderAll();
-  if (flash) showAlert(flash, 'ok');
-  else clearAlert();
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c],
+  );
 }
 
-function renderAll() {
-  const d = state.data;
-  $('#hashline').textContent = state.currentHash
-    ? `当前数据指纹 sha256:${state.currentHash.slice(0, 16)}…`
-    : '尚未配置转子';
+// ---------- 工作台分区加载框架 ----------
 
-  // 首次或孔位数变化时重建本地编辑缓冲
-  const N = d ? d.holes : null;
-  if (editorN !== N) {
-    editorN = N;
-    if (d) {
-      holesSel.value = String(d.holes);
-      $('#tolerance').value = d.tolerance;
-      tubeRows = d.tubes.map((t) => ({
-        id: t.id,
-        mass: t.mass,
-        holes: new Set(t.usableHoles),
-      }));
-      weightRows = d.weights.map((w) => ({ mass: w.mass, quantity: w.quantity }));
-      exclRows = (d.exclusionPairs || []).map((p) => ({ a: p.a, b: p.b }));
-      fixedRows = (d.fixedSlots || []).map((f) => ({ tube: f.tube, hole: f.hole }));
-    } else {
-      exclRows = [];
-      fixedRows = [];
+const WB_LIMIT = 20; // 每个历史区块首页/翻页的有界页大小
+
+const SECTIONS = {
+  publications: { bar: 'publications-bar', render: renderPublications },
+  verifications: { bar: 'verifications-bar', render: renderVerifications },
+  reservations: { bar: 'reservations-bar', render: renderReservations },
+  suspensions: { bar: 'suspensions-bar', render: renderSuspensions },
+  runs: { bar: 'runs-bar', render: renderRuns },
+  maintenances: { bar: 'maintenances-bar', render: renderMaintenances },
+  calibrations: { bar: 'calibrations-bar', render: renderCalibrations },
+};
+
+// 每区块独立状态：首屏与写入后刷新只取首页；查看旧记录时逐页追加。
+// 区块刷新失败不清空已渲染的 items（若有），页面其余部分继续可用。
+const store = Object.fromEntries(
+  Object.keys(SECTIONS).map((k) => [
+    k,
+    {
+      items: [],
+      hasMore: false,
+      nextBeforeId: null,
+      status: 'loading', // loading | ready | error（首页加载状态）
+      error: null,
+      loadingMore: false,
+      moreError: null,
+    },
+  ]),
+);
+
+function sectionUrl(key, { first = false } = {}) {
+  const s = store[key];
+  const params = new URLSearchParams({ limit: String(WB_LIMIT) });
+  if (!first && s.nextBeforeId != null) params.set('beforeId', String(s.nextBeforeId));
+  return `/api/workbench/history/${key}?${params.toString()}`;
+}
+
+// 取区块首页（首屏 / 写入后刷新 / 单独重试）
+async function loadFirst(key) {
+  const s = store[key];
+  s.status = 'loading';
+  s.error = null;
+  s.moreError = null;
+  s.items = [];
+  s.hasMore = false;
+  s.nextBeforeId = null;
+  s.loadingMore = false;
+  renderSection(key);
+  try {
+    const page = await api('GET', sectionUrl(key, { first: true }));
+    s.items = page.items;
+    s.hasMore = page.hasMore;
+    s.nextBeforeId = page.nextBeforeId;
+    s.status = 'ready';
+  } catch (e) {
+    s.status = 'error';
+    s.error = e.message;
+  }
+  renderSection(key);
+}
+
+// 翻下一页（同一轮以 nextBeforeId 为游标；单页失败保留已加载记录并可单独重试）
+async function loadMore(key) {
+  const s = store[key];
+  if (s.loadingMore || !s.hasMore || s.nextBeforeId == null) return;
+  s.loadingMore = true;
+  s.moreError = null;
+  renderSection(key);
+  try {
+    const page = await api('GET', sectionUrl(key));
+    s.items = s.items.concat(page.items);
+    s.hasMore = page.hasMore;
+    s.nextBeforeId = page.nextBeforeId;
+    s.status = 'ready';
+    s.error = null;
+  } catch (e) {
+    s.moreError = e.message;
+  }
+  s.loadingMore = false;
+  renderSection(key);
+}
+
+function renderSection(key) {
+  renderSectionBar(key);
+  SECTIONS[key].render();
+}
+
+function renderSectionBar(key) {
+  const el = document.getElementById(SECTIONS[key].bar);
+  const s = store[key];
+  let html = '';
+  if (s.status === 'loading' && s.items.length === 0) {
+    html = '<span class="muted">加载中…</span>';
+  } else if (s.status === 'error' && s.items.length === 0) {
+    html = `<div class="banner bad" style="margin:0">该区块读取失败：${escapeHtml(s.error)}
+      <button class="wb-retry" data-wb-retry="${key}">重试</button></div>`;
+  } else {
+    const parts = [];
+    if (s.items.length > 0) {
+      parts.push(`<span class="muted">已显示 ${s.items.length} 条（按记录编号倒序）</span>`);
     }
+    if (s.loadingMore) {
+      parts.push('<span class="muted">正在取回更早记录…</span>');
+    } else if (s.moreError) {
+      parts.push(
+        `<span class="tag-bad">更早记录读取失败：${escapeHtml(s.moreError)}</span>` +
+          `<button class="wb-retry" data-wb-retry-more="${key}">重试本页</button>`,
+      );
+    } else if (s.hasMore) {
+      parts.push(`<button class="wb-more" data-wb-more="${key}">查看更早记录</button>`);
+    }
+    if (s.status === 'error') {
+      parts.push(
+        `<span class="tag-bad">本区块刷新失败：${escapeHtml(s.error)}</span>` +
+          `<button class="wb-retry" data-wb-retry="${key}">重试</button>`,
+      );
+    }
+    html = parts.join(' · ');
+  }
+  el.innerHTML = html ? `<div class="wb-bar-inner">${html}</div>` : '';
+  el.querySelectorAll('[data-wb-retry]').forEach((b) =>
+    b.addEventListener('click', () => loadFirst(b.dataset.wbRetry)),
+  );
+  el.querySelectorAll('[data-wb-retry-more]').forEach((b) =>
+    b.addEventListener('click', () => loadMore(b.dataset.wbRetryMore)),
+  );
+  el.querySelectorAll('[data-wb-more]').forEach((b) =>
+    b.addEventListener('click', () => loadMore(b.dataset.wbMore)),
+  );
+}
+
+// ---------- 工作台概览（当前配置 + 可执行状态） ----------
+
+async function loadOverview() {
+  ovStatus = 'loading';
+  ovError = null;
+  renderOvBar();
+  renderOverview();
+  try {
+    ov = await api('GET', '/api/workbench/overview');
+    ovStatus = 'ready';
+  } catch (e) {
+    ovStatus = 'error';
+    ovError = e.message;
+  }
+  renderOvBar();
+  renderOverview();
+}
+
+function renderOvBar() {
+  const el = $('#ov-bar');
+  if (ovStatus === 'error') {
+    el.className = 'wb-banner';
+    el.innerHTML = `<div class="banner bad" style="margin:0">
+      当前配置 / 可执行状态读取失败：${escapeHtml(ovError)}
+      <button id="ov-retry" class="wb-retry">重试</button>
+      （其他区块与未提交的编辑仍可使用）</div>`;
+    $('#ov-retry').addEventListener('click', loadOverview);
+  } else {
+    el.className = 'wb-banner hidden';
+    el.innerHTML = '';
+  }
+}
+
+// 写入后刷新：并行重新取「概览 + 各区块首个有界页 + 日程」，全部互不阻塞。
+// 任一失败由对应区块的重试条承接；未提交的编辑缓冲不依赖读取结果，始终保留。
+async function refresh(flash) {
+  await Promise.allSettled([
+    loadOverview(),
+    ...Object.keys(SECTIONS).map((k) => loadFirst(k)),
+    loadSchedule(),
+  ]);
+  if (flash) {
+    if (ovStatus === 'ready') showAlert(flash, 'ok');
+    else showAlert(`${flash}（当前配置读取失败，可点上方「重试」）`, 'err');
+  } else if (ovStatus === 'ready') {
+    clearAlert();
+  }
+}
+
+function renderOverview() {
+  const d = ov ? ov.data : null;
+  $('#hashline').textContent =
+    ovStatus === 'error'
+      ? '当前配置读取失败（可点上方「重试」；其他区块仍可用）'
+      : ov && ov.currentHash
+        ? `当前数据指纹 sha256:${ov.currentHash.slice(0, 16)}…`
+        : ov
+          ? '尚未配置转子'
+          : '正在读取当前配置…';
+
+  // 首次或孔位数变化时重建本地编辑缓冲（刷新不重置，保留未提交编辑）
+  const N = d ? d.holes : null;
+  if (d && editorN !== N) {
+    editorN = N;
+    holesSel.value = String(d.holes);
+    $('#tolerance').value = d.tolerance;
+    tubeRows = d.tubes.map((t) => ({ id: t.id, mass: t.mass, holes: new Set(t.usableHoles) }));
+    weightRows = d.weights.map((w) => ({ mass: w.mass, quantity: w.quantity }));
+    exclRows = (d.exclusionPairs || []).map((p) => ({ a: p.a, b: p.b }));
+    fixedRows = (d.fixedSlots || []).map((f) => ({ tube: f.tube, hole: f.hole }));
   }
 
   renderHoleMax(d);
@@ -88,14 +275,11 @@ function renderAll() {
   renderFixedTable();
   renderWeightTable();
   renderDraft();
-  renderPublications();
-  renderVerifications();
+  renderDevices();
+  // 下列区块的表单下拉/可选规格依赖当前配置与可执行状态，概览变化时重绘
   renderReservations();
   renderSuspensions();
   renderRuns();
-  renderDevices();
-  renderMaintenances();
-  renderCalibrations();
 }
 
 function renderHoleMax(d) {
@@ -194,7 +378,7 @@ $('#add-tube').addEventListener('click', () => {
 function tubeIdOptions(selected) {
   // 下拉选项来自已保存的离心管（服务端按已保存数据校验）；
   // 当前值不在其中时保留原值并标记（保存时会被服务端拒绝）。
-  const ids = state.data ? state.data.tubes.map((t) => t.id) : [];
+  const ids = ov && ov.data ? ov.data.tubes.map((t) => t.id) : [];
   const opts = ['<option value="">（选择离心管）</option>'];
   for (const id of ids) {
     opts.push(
@@ -240,7 +424,7 @@ function renderExclusionTable() {
 }
 
 $('#add-exclusion').addEventListener('click', () => {
-  if (!state.data) return showAlert('请先保存转子配置并录入离心管。', 'err');
+  if (!ov || !ov.data) return showAlert('请先保存转子配置并录入离心管。', 'err');
   exclRows.push({ a: '', b: '' });
   renderExclusionTable();
 });
@@ -259,7 +443,7 @@ $('#save-exclusions').addEventListener('click', async () => {
 
 function holeOptions(selected) {
   // 下拉选项为当前孔位 0..N-1；当前值越界时保留原值并标记（保存时会被服务端拒绝）
-  const N = state.data ? state.data.holes : editorN;
+  const N = ov && ov.data ? ov.data.holes : editorN;
   const opts = ['<option value="">（选择孔位）</option>'];
   for (let h = 0; h < N; h += 1) {
     opts.push(`<option value="${h}"${h === selected ? ' selected' : ''}>${h}</option>`);
@@ -303,7 +487,7 @@ function renderFixedTable() {
 }
 
 $('#add-fixed').addEventListener('click', () => {
-  if (!state.data) return showAlert('请先保存转子配置并录入离心管。', 'err');
+  if (!ov || !ov.data) return showAlert('请先保存转子配置并录入离心管。', 'err');
   fixedRows.push({ tube: '', hole: '' });
   renderFixedTable();
 });
@@ -447,7 +631,7 @@ function arrangementHtml(result) {
 }
 
 function renderDraft() {
-  const draft = state.draft;
+  const draft = ov ? ov.draft : null;
   const staleBox = $('#draft-stale');
   const noneBox = $('#draft-none');
   const body = $('#draft-body');
@@ -472,8 +656,8 @@ function renderDraft() {
     return;
   }
   const r = draft.result;
-  const excl = state.data && state.data.exclusionPairs ? state.data.exclusionPairs : [];
-  const fixed = state.data && state.data.fixedSlots ? state.data.fixedSlots : [];
+  const excl = ov && ov.data && ov.data.exclusionPairs ? ov.data.exclusionPairs : [];
+  const fixed = ov && ov.data && ov.data.fixedSlots ? ov.data.fixedSlots : [];
   body.innerHTML = `
     <div class="metrics">
       <div>使用配重块：<b>${r.weightCount}</b> 枚（已最小化）</div>
@@ -505,11 +689,14 @@ $('#publish').addEventListener('click', async () => {
 
 function renderPublications() {
   const box = $('#pub-list');
-  if (state.publications.length === 0) {
-    box.innerHTML = '<div class="muted">暂无发布记录。</div>';
+  const list = store.publications.items;
+  if (store.publications.status !== 'ready' || list.length === 0) {
+    if (store.publications.status === 'ready') {
+      box.innerHTML = '<div class="muted">暂无发布记录。</div>';
+    }
     return;
   }
-  box.innerHTML = state.publications
+  box.innerHTML = list
     .map(
       (p) => `<div class="pub-row">
         <div>
@@ -575,21 +762,19 @@ async function openPublication(id) {
 }
 $('#pub-close').addEventListener('click', () => $('#pub-dialog').close());
 
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) =>
-    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
-}
-
 // ---------- 现场装载核验 ----------
 
 let verDetail = null; // GET /api/verifications/:id 的完整响应（编辑器数据源）
 
 function renderVerifications() {
   const box = $('#verify-list');
-  const list = state.verifications || [];
-  if (list.length === 0) {
-    box.innerHTML =
-      '<div class="muted">尚无核验记录。在第 7 节对可用于当前装载的发布记录点「现场核验此图」即可开始。</div>';
+  const sec = store.verifications;
+  const list = sec.items;
+  if (sec.status !== 'ready' || list.length === 0) {
+    if (sec.status === 'ready') {
+      box.innerHTML =
+        '<div class="muted">尚无核验记录。在第 7 节对可用于当前装载的发布记录点「现场核验此图」即可开始。</div>';
+    }
     return;
   }
   box.innerHTML = list
@@ -882,9 +1067,9 @@ function usageText(usage) {
 }
 
 function renderReservations() {
-  // 预约表单：可选发布图（仅当前可用）
+  // 预约表单：可选发布图（可执行状态中的「当前可用发布图」全量列表，不依赖历史分页）
   const sel = $('#res-pub');
-  const usable = state.publications.filter((p) => p.usable);
+  const usable = ov ? ov.actionable.usablePublications : [];
   const prev = sel.value;
   sel.innerHTML = usable.length
     ? usable
@@ -896,12 +1081,13 @@ function renderReservations() {
     : '<option value="">（暂无可用发布图）</option>';
   if (usable.some((p) => String(p.id) === prev)) sel.value = prev;
 
-  // 预约列表
+  // 预约列表（首页 + 翻页）
   const box = $('#res-list');
-  const list = state.reservations || [];
-  if (list.length === 0) {
+  const sec = store.reservations;
+  const list = sec.items;
+  if (sec.status === 'ready' && list.length === 0) {
     box.innerHTML = '<div class="muted">暂无预约记录。</div>';
-  } else {
+  } else if (list.length > 0) {
     box.innerHTML = `<div class="table-wrap"><table class="res-table">
       <thead><tr>
         <th>批次号</th><th>依据图</th><th>时段（UTC，左闭右开）</th><th>占用规格</th>
@@ -933,15 +1119,49 @@ function renderReservations() {
       b.addEventListener('click', () => cancelReservation(Number(b.dataset.resCancel))),
     );
   }
-
-  loadSchedule().catch(() => {});
 }
 
+// 占用日程：独立加载（不阻塞任何区块），失败可单独重试
+let schStatus = 'loading'; // loading | ready | error
+let schError = null;
+let schData = null;
+
 async function loadSchedule() {
-  const sch = await api('GET', '/api/schedule');
+  schStatus = 'loading';
+  schError = null;
+  renderSchedule();
+  try {
+    schData = await api('GET', '/api/schedule');
+    schStatus = 'ready';
+  } catch (e) {
+    schStatus = 'error';
+    schError = e.message;
+  }
+  renderSchedule();
+}
+
+function renderSchedule() {
   const box = $('#res-schedule');
+  if (schStatus === 'loading' && schData === null) {
+    box.innerHTML = '<div class="muted">占用日程加载中…</div>';
+    return;
+  }
+  if (schStatus === 'error' && schData === null) {
+    box.innerHTML = `<div class="banner bad">占用日程读取失败：${escapeHtml(schError)}
+      <button id="sch-retry" class="wb-retry">重试</button></div>`;
+    $('#sch-retry').addEventListener('click', loadSchedule);
+    return;
+  }
+  const sch = schData;
   if (!sch.specs || sch.specs.length === 0) {
-    box.innerHTML = '<div class="muted">当前无生效中的预约占用或停用。</div>';
+    box.innerHTML =
+      '<div class="muted">当前无生效中的预约占用或停用。</div>' +
+      (schStatus === 'error'
+        ? `<br><span class="tag-bad">刷新失败：${escapeHtml(schError)}</span>
+           <button class="wb-retry" id="sch-retry2">重试</button>`
+        : '');
+    const r2 = $('#sch-retry2');
+    if (r2) r2.addEventListener('click', loadSchedule);
     return;
   }
   box.innerHTML = sch.specs
@@ -981,7 +1201,13 @@ async function loadSchedule() {
       }
     </div>`,
     )
-    .join('');
+    .join('') +
+    (schStatus === 'error'
+      ? `<div class="banner bad">日程刷新失败：${escapeHtml(schError)}
+         <button class="wb-retry" id="sch-retry2">重试</button></div>`
+      : '');
+  const r2 = $('#sch-retry2');
+  if (r2) r2.addEventListener('click', loadSchedule);
 }
 
 // datetime-local 值按 UTC 解释（服务端对无时区后缀的 ISO 时间一律按 UTC 处理）
@@ -1049,9 +1275,9 @@ const SUS_PHASE_LABEL = {
 };
 
 function renderSuspensions() {
-  // 规格下拉：仅当前录入规格
+  // 规格下拉：仅当前录入规格（读取时现状）
   const sel = $('#sus-mass');
-  const weights = (state.data && state.data.weights) || [];
+  const weights = ov && ov.data ? ov.data.weights : [];
   const prev = sel.value;
   sel.innerHTML = weights.length
     ? weights
@@ -1061,11 +1287,13 @@ function renderSuspensions() {
   if (weights.some((w) => String(w.mass) === prev)) sel.value = prev;
 
   const box = $('#sus-list');
-  const list = state.suspensions || [];
-  if (list.length === 0) {
+  const sec = store.suspensions;
+  const list = sec.items;
+  if (sec.status === 'ready' && list.length === 0) {
     box.innerHTML = '<div class="muted">暂无停用记录。</div>';
     return;
   }
+  if (list.length === 0) return;
   box.innerHTML = `<div class="table-wrap"><table class="res-table">
     <thead><tr>
       <th>规格</th><th>停用数量</th><th>原因</th><th>时段（UTC，左闭右开）</th>
@@ -1152,9 +1380,9 @@ const RUN_STATUS_LABEL = {
 };
 
 function renderRuns() {
-  // 核验下拉：仅展示已完成核验（未完成草稿不能开始运行）
+  // 核验下拉：可执行状态中的「已完成核验」（全量，不受运行历史分页影响）
   const verSel = $('#run-ver');
-  const verList = (state.verifications || []).filter((v) => v.completed);
+  const verList = ov ? ov.actionable.completedVerifications : [];
   const verPrev = verSel.value;
   verSel.innerHTML = verList.length
     ? verList
@@ -1166,9 +1394,9 @@ function renderRuns() {
     : '<option value="">（暂无已完成核验）</option>';
   if (verList.some((v) => String(v.id) === verPrev)) verSel.value = verPrev;
 
-  // 预约下拉：仅展示生效中预约（已取消不能开始运行）
+  // 预约下拉：可执行状态中的「生效中预约」（全量；已取消不在其中）
   const resSel = $('#run-res');
-  const resList = (state.reservations || []).filter((r) => r.status === 'active');
+  const resList = ov ? ov.actionable.activeReservations : [];
   const resPrev = resSel.value;
   resSel.innerHTML = resList.length
     ? resList
@@ -1181,11 +1409,13 @@ function renderRuns() {
   if (resList.some((r) => String(r.id) === resPrev)) resSel.value = resPrev;
 
   const box = $('#run-list');
-  const list = state.runs || [];
-  if (list.length === 0) {
+  const sec = store.runs;
+  const list = sec.items;
+  if (sec.status === 'ready' && list.length === 0) {
     box.innerHTML = '<div class="muted">暂无运行记录。</div>';
     return;
   }
+  if (list.length === 0) return;
   box.innerHTML = `<div class="table-wrap"><table class="res-table">
     <thead><tr>
       <th>运行编号</th><th>设备</th><th>状态</th><th>超时</th>
@@ -1380,13 +1610,17 @@ $('#run-detail-close').addEventListener('click', () => $('#run-dialog').close())
 // ---------- 设备保养 ----------
 
 function renderDevices() {
-  const devs = state.devices || [];
+  const devs = ov ? ov.actionable.devices : [];
   // 已知设备编号下拉提示（供上限设置与保养登记两个表单共用）
   $('#known-devices').innerHTML = devs
     .map((d) => `<option value="${escapeHtml(d.deviceNo)}">`)
     .join('');
 
   const box = $('#dev-list');
+  if (!ov) {
+    box.innerHTML = '<div class="muted">设备状态加载中…</div>';
+    return;
+  }
   if (devs.length === 0) {
     box.innerHTML =
       '<div class="muted">暂无设备记录（开始运行、设置上限或登记保养后在此呈现）。</div>';
@@ -1441,11 +1675,13 @@ function calibrationCell(c) {
 
 function renderMaintenances() {
   const box = $('#maint-list');
-  const list = state.maintenances || [];
-  if (list.length === 0) {
+  const sec = store.maintenances;
+  const list = sec.items;
+  if (sec.status === 'ready' && list.length === 0) {
     box.innerHTML = '<div class="muted">暂无保养记录。</div>';
     return;
   }
+  if (list.length === 0) return;
   box.innerHTML = `<div class="table-wrap"><table class="res-table">
     <thead><tr>
       <th>保养单号</th><th>设备编号</th><th>原因</th><th>登记时间（UTC，新周期起点）</th>
@@ -1522,11 +1758,13 @@ const CALIB_PHASE_LABEL = {
 
 function renderCalibrations() {
   const box = $('#calib-list');
-  const list = state.calibrations || [];
-  if (list.length === 0) {
+  const sec = store.calibrations;
+  const list = sec.items;
+  if (sec.status === 'ready' && list.length === 0) {
     box.innerHTML = '<div class="muted">暂无校准记录。</div>';
     return;
   }
+  if (list.length === 0) return;
   box.innerHTML = `<div class="table-wrap"><table class="res-table">
     <thead><tr>
       <th>校准单号</th><th>设备编号</th><th>结论</th><th>校准时间（UTC）</th>
@@ -1572,6 +1810,8 @@ $('#calib-submit').addEventListener('click', async () => {
   }
 });
 
-// ---------- 启动 ----------
+// ---------- 启动：概览、各历史区块首页与日程并行独立加载 ----------
 
-refresh().catch((e) => showAlert('初始化失败：' + e.message, 'err'));
+loadOverview();
+for (const key of Object.keys(SECTIONS)) loadFirst(key);
+loadSchedule();

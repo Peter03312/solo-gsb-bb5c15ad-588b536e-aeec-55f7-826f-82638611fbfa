@@ -275,3 +275,29 @@ tr.row-stale { opacity: 0.6; }
   flex-wrap: wrap;
   margin-bottom: 6px;
 }
+
+/* 工作台分页 / 分区读取状态 */
+.wb-banner { margin: 12px 20px 0; }
+.wb-bar { margin-top: 10px; }
+.wb-bar-inner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  background: #fafbfd;
+}
+.wb-more, .wb-retry {
+  border: 1px solid var(--primary);
+  background: #fff;
+  color: var(--primary);
+  border-radius: 6px;
+  padding: 3px 12px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.wb-more:hover, .wb-retry:hover { background: #eef4fc; }
+.wb-retry { border-color: var(--bad); color: var(--bad); }
+.wb-retry:hover { background: var(--bad-bg); }

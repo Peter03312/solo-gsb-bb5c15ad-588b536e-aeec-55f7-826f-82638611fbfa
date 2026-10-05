@@ -85,6 +85,17 @@ import {
   getBookingRowByBatch,
   listBookingRows,
   insertBooking,
+  listPublicationsPage,
+  listVerificationRowsPage,
+  listReservationRowsPage,
+  listSuspensionRowsPage,
+  listRunRowsPage,
+  listMaintenanceRowsPage,
+  listCalibrationRowsPage,
+  listItemRowsPage,
+  listCheckoutRowsPage,
+  listScheduleRowsPage,
+  listBookingRowsPage,
 } from './db.js';
 import { solve, verify, computeHash } from './solver.js';
 import { normalizeEntries, measureProgress, verifyMeasurements } from './verify.js';
@@ -2802,6 +2813,236 @@ export function createApp(db) {
       });
       tx();
       res.status(201).json(view);
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  // ---------- 工作台读取链路（首屏/写入后刷新：配置 + 可执行状态 + 各区块首个有界历史页） ----------
+  //
+  // 背景：发布图、核验、预约、停用、运行等历史只追加、逐年累积；旧链路（GET /api/state
+  // 与各全量列表）每次刷新都读取并渲染全部历史。工作台改为：
+  //   - GET /api/workbench/overview：当前配置/数据指纹/草稿 + 可执行状态
+  //     （当前可用发布图、已完成核验、生效预约、设备状态），均按读取时现状计算；
+  //   - GET /api/workbench/history/:section：各历史区块的有界键集翻页，固定按 id 倒序，
+  //     beforeId 为本轮上一页最后一条记录的 id；同轮翻页期间新插入的记录不会导致
+  //     本轮已有记录重复或遗漏，新记录在重新取首页后可见。
+  // 运行列表只给轻量字段（冻结依据详情仍由 GET /api/runs/:id 按需读取，冻结内容永不改写）。
+  // 旧接口 GET /api/state、写入与详情接口保持原样，供旧客户端使用。
+
+  const WB_DEFAULT_LIMIT = 20;
+  const WB_MAX_LIMIT = 100;
+
+  function parseWbPaging(query) {
+    const errors = [];
+    let limit = WB_DEFAULT_LIMIT;
+    if (query.limit !== undefined) {
+      if (!/^[1-9]\d*$/.test(String(query.limit))) {
+        errors.push(`limit 必须是正整数（每页条数，最大 ${WB_MAX_LIMIT}）`);
+      } else {
+        limit = Number(query.limit);
+        if (limit > WB_MAX_LIMIT) {
+          errors.push(`limit 不得超过 ${WB_MAX_LIMIT}`);
+        }
+      }
+    }
+    let beforeId = null;
+    if (query.beforeId !== undefined && query.beforeId !== '') {
+      if (!/^[1-9]\d*$/.test(String(query.beforeId))) {
+        errors.push('beforeId 必须是上一页返回的 nextBeforeId（正整数）');
+      } else {
+        beforeId = Number(query.beforeId);
+      }
+    }
+    return { errors, limit, beforeId };
+  }
+
+  // 把一页行（多取 1 条用于判定 hasMore）规整为有界页响应。
+  function pageResponse(section, limit, rows, mapRow) {
+    const items = rows.slice(0, limit).map(mapRow);
+    const hasMore = rows.length > limit;
+    const last = items[items.length - 1];
+    return {
+      section,
+      order: 'id_desc',
+      limit,
+      items,
+      hasMore,
+      // 下一页游标：本页最后一条记录的 id；无更多记录时为 null
+      nextBeforeId: hasMore && last ? last.id : null,
+    };
+  }
+
+  // 发布图列表项（行来自有界翻页查询；可用性按读取时的当前指纹计算）
+  function publicationListItem(row, hash) {
+    const feasible = !!row.feasible;
+    return {
+      id: row.id,
+      createdAt: row.created_at,
+      basisHash: row.basis_hash,
+      feasible,
+      weightCount: row.weight_count,
+      diffSum: row.diff_sum,
+      reasons: row.reasons ? JSON.parse(row.reasons) : [],
+      usable: hash !== null && feasible && row.basis_hash === hash,
+    };
+  }
+
+  // 运行列表项：轻量字段。冻结依据中的完整发布图/核验明细不在列表返回，
+  // 由 GET /api/runs/:id 按需读取（frozenBasis 冻结列永不被改写）。
+  function runListView(row, hash, nowMs) {
+    const ended = !!row.ended_at;
+    const reservationEndMs = Date.parse(row.frozen_reservation_end_utc);
+    const view = {
+      id: row.id,
+      runNo: row.run_no,
+      deviceNo: row.device_no,
+      verificationId: row.verification_id,
+      reservationId: row.reservation_id,
+      publicationId: row.publication_id,
+      status: ended ? row.outcome : 'running',
+      outcome: ended ? row.outcome : null,
+      timedOut: !!row.timed_out,
+      startUtc: row.start_utc,
+      endedAt: row.ended_at,
+      createdAt: row.created_at,
+      phase: ended ? 'ended' : nowMs >= reservationEndMs ? 'overrunning' : 'running',
+      // 列表中只保留展示用的冻结依据指针与按读取时现状计算的可用性；
+      // 完整冻结快照（装载图/核验判定/预约占用/校准依据）见 GET /api/runs/:id。
+      frozenBasis: {
+        publication: {
+          id: row.publication_id,
+          basisHash: row.frozen_basis_hash,
+          feasible: !!row.frozen_pub_feasible,
+          currentlyUsable:
+            hash !== null &&
+            !!row.frozen_pub_feasible &&
+            row.frozen_basis_hash === hash,
+        },
+        reservationCurrentStatus: null,
+      },
+    };
+    const resRow = getReservationRow(db, row.reservation_id);
+    if (resRow) view.frozenBasis.reservationCurrentStatus = resRow.status;
+    if (!ended) {
+      view.withinReservationWindow = isWithinReservation(
+        Date.parse(row.frozen_reservation_start_utc),
+        reservationEndMs,
+        nowMs,
+      );
+    }
+    return view;
+  }
+
+  app.get('/api/workbench/overview', (req, res) => {
+    const data = loadData(db);
+    const hash = data ? computeHash(data) : null;
+    const rawDraft = getDraft(db);
+    const draft = rawDraft
+      ? { ...rawDraft, stale: hash === null || rawDraft.basisHash !== hash }
+      : null;
+    const nowMs = Date.now();
+    // 可执行状态（下拉与动作按钮的依据，按读取时现状计算，不依赖已翻到的历史页）
+    const publications = listPublications(db).map((p) => ({
+      ...p,
+      usable: hash !== null && p.feasible && p.basisHash === hash,
+    }));
+    const verifications = serializeVerifications(db, hash);
+    res.json({
+      data,
+      currentHash: hash,
+      draft,
+      actionable: {
+        usablePublications: publications.filter((p) => p.usable),
+        completedVerifications: verifications.filter((v) => v.completed),
+        activeReservations: listReservationRows(db)
+          .filter((r) => r.status === 'active')
+          .map((r) => reservationView(r, hash, nowMs)),
+        devices: listDeviceViews(db),
+      },
+    });
+  });
+
+  // 各区块首个有界历史页及后续翻页（同一轮翻页以 nextBeforeId 稳定逐页向后）。
+  // section 取值：publications/verifications/reservations/suspensions/runs/
+  // maintenances/calibrations/items/checkouts/schedules/bookings。
+  const WB_HISTORY_SECTIONS = {
+    publications: {
+      fetch: (q) => listPublicationsPage(db, q),
+      map: (row, ctx) => publicationListItem(row, ctx.hash),
+    },
+    verifications: {
+      fetch: (q) => listVerificationRowsPage(db, q),
+      map: (row, ctx) => verificationSummary(row, ctx.hash),
+    },
+    reservations: {
+      fetch: (q) => listReservationRowsPage(db, q),
+      map: (row, ctx) => reservationView(row, ctx.hash, ctx.nowMs),
+    },
+    suspensions: {
+      fetch: (q) => listSuspensionRowsPage(db, q),
+      map: (row, ctx) => suspensionView(row, ctx.nowMs),
+    },
+    runs: {
+      fetch: (q) => listRunRowsPage(db, q),
+      map: (row, ctx) => runListView(row, ctx.hash, ctx.nowMs),
+    },
+    maintenances: {
+      fetch: (q) => listMaintenanceRowsPage(db, q),
+      map: (row) => maintenanceView(row),
+    },
+    calibrations: {
+      fetch: (q) => listCalibrationRowsPage(db, q),
+      map: (row, ctx) => calibrationView(row, ctx.nowMs),
+    },
+    items: {
+      fetch: (q) => listItemRowsPage(db, q),
+      map: (row) => itemView(row),
+    },
+    checkouts: {
+      fetch: (q) => listCheckoutRowsPage(db, q),
+      map: (row, ctx) => checkoutView(row, ctx.nowMs),
+    },
+    schedules: {
+      fetch: (q) => listScheduleRowsPage(db, q),
+      map: (row, ctx) => scheduleView(row, ctx.nowMs),
+    },
+    bookings: {
+      fetch: (q) => listBookingRowsPage(db, q),
+      map: (row) => bookingView(row),
+    },
+  };
+
+  app.get('/api/workbench/history/:section', (req, res, next) => {
+    try {
+      const section = req.params.section;
+      const handler = WB_HISTORY_SECTIONS[section];
+      if (!handler) {
+        return res.status(404).json({
+          error: '未知历史区块',
+          errors: [
+            `历史区块「${section}」不存在；可用区块：${Object.keys(WB_HISTORY_SECTIONS).join('、')}`,
+          ],
+        });
+      }
+      const { errors, limit, beforeId } = parseWbPaging(req.query);
+      if (errors.length) throw new ValidationError(errors);
+      const query = { beforeId, limit };
+      if (section === 'schedules') {
+        if (req.query.status !== undefined) {
+          if (!['active', 'cancelled', 'reassigned'].includes(String(req.query.status))) {
+            throw new ValidationError([
+              'status 仅支持 active / cancelled / reassigned（缺省返回全部）',
+            ]);
+          }
+          query.status = String(req.query.status);
+        }
+      } else if (req.query.status !== undefined) {
+        throw new ValidationError([`区块「${section}」不支持 status 过滤`]);
+      }
+      const ctx = { hash: currentHash(db), nowMs: Date.now() };
+      const rows = handler.fetch(query);
+      res.json(pageResponse(section, limit, rows, (row) => handler.map(row, ctx)));
     } catch (e) {
       next(e);
     }

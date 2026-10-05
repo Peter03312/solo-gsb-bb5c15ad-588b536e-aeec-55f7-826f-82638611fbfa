@@ -381,6 +381,8 @@ npm test
 | POST | `/api/bookings` | 找时段预约（`batchNo` 批次号 + `publicationId` 发布图编号 + `durationSeconds` 正整数秒时长 + `windowStartUtc`/`windowEndUtc` UTC 搜索窗口 + `deviceNos` 候选设备编号数组；窗口起点须**晚于服务端当前时刻**）。事务内重读冻结图/当前库存/重叠预约与停用/设备排班，找窗口内**能完整容纳时长的最早起点**（并列取设备编号字典序最小），原子生成**共用时段的预约与设备排班**；201 新建、200 同号同请求幂等重放（返回原冻结结果）、400 非法输入/图不可用/窗口不合法、409 无可行时段（附 `detail.conflicts` 冲突规格与时段）或批次号撞号（附 `existingId`） |
 | GET | `/api/bookings` | 找时段预约列表（批次号、发布图、时长、搜索窗口、当选设备与时段、关联预约/排班编号、状态） |
 | GET | `/api/bookings/:id` | 单条找时段预约详情（含冻结的搜索窗口与当选结果）；不存在返回 404 |
+| GET | `/api/workbench/overview` | **工作台首屏/写入后刷新概览**：当前录入数据（`data`）、数据指纹、草稿（含是否过期）+「可执行状态」`actionable`（当前可用发布图 `usablePublications`、已完成核验 `completedVerifications`、生效预约 `activeReservations`、设备状态 `devices`，均按读取时现状计算，不受历史分页影响）。不含历史长列表 |
+| GET | `/api/workbench/history/:section` | **工作台历史区块有界键集翻页**：`section` 为 publications/verifications/reservations/suspensions/runs/maintenances/calibrations/items/checkouts/schedules/bookings；固定按记录 id 倒序，`limit`（1–100，默认 20）取有界首页，`beforeId=<上一页 nextBeforeId>` 逐页取回更早记录。返回 `{section,order:'id_desc',limit,items,hasMore,nextBeforeId}`；同一轮翻页期间新插入记录不影响本轮游标（不重不漏），新记录在重新取首页后可见。运行区块列表项为轻量字段（完整冻结依据仍由 `GET /api/runs/:id` 按需读取）；`schedules` 支持 `?status=active\|cancelled\|reassigned`（缺省全部），未知区块 404、非法参数 400 |
 
 错误统一返回 `400 {"error","errors":[...]}`；状态冲突（草稿已存在、版本过期、核验已冻结、
 预约批次号冲突、配重数量不足等）返回 `409` 并附带 `existingId` / `currentVersion` 等字段。
@@ -1179,11 +1181,98 @@ curl -s $BASE/api/bookings
 curl -s $BASE/api/bookings/1
 ```
 
+## 工作台读取链路 HTTP API 调用示例
+
+发布图、核验、预约、停用、运行等记录只追加、逐年累积。浏览器工作台（`public/`）
+不再在每次刷新时经 `GET /api/state` 读取并渲染全部历史，而是：
+
+1. **首屏 / 单次写入后的刷新**：只取「当前配置 + 可执行状态」（`/api/workbench/overview`）
+   与各历史区块的**首个有界页**（`/api/workbench/history/:section`，默认每页 20 条）；
+2. **查看旧记录**：在同一区块用稳定游标 `beforeId`（上一页响应中的 `nextBeforeId`）
+   逐页取回。所有区块固定**按记录 id 倒序**；同一轮翻页期间即使插入新记录，本轮开始前
+   已有记录也**不会重复或遗漏**（新记录 id 更大，落在游标之外）；**新记录在重新取首页
+   （刷新）后可见**；
+3. **列表状态按读取时现状显示**：发布图当前可用性（`usable`/`currentlyUsable`）、
+   预约与停用的 `phase`/`cancellable`/`revocable`、设备空闲状态都在每次读取时按当前数据
+   重新计算；**运行的冻结依据与历史记录绝不改写**（运行列表仅给轻量字段，完整冻结依据
+   由 `GET /api/runs/:id` 按需读取）；发布快照、核验录入等详情也仍按需调用原详情接口；
+4. **区块相互独立**：某区块读取失败时该区块单独显示「重试」，其他区块与未提交的编辑
+   内容保持可用；占用日程（`/api/schedule`）同样独立加载、可单独重试。
+
+旧客户端不受影响：`GET /api/state` 的**完整响应**以及全部写入、详情接口约定保持不变
+（工作台只是不再调用全量状态接口）。
+
+```bash
+BASE=http://localhost:8080
+
+# 1) 概览：当前配置/指纹/草稿 + 可执行状态（当前可用发布图、已完成核验、
+#    生效预约、设备状态）。可执行状态为全量计算，下拉/动作按钮不依赖历史翻到第几页。
+curl -s $BASE/api/workbench/overview
+# -> {"data":{"holes":4,...},"currentHash":"f199…","draft":{...,"stale":false},
+#     "actionable":{
+#       "usablePublications":[{id:3,usable:true,...}],
+#       "completedVerifications":[{id:1,completed:true,...}],
+#       "activeReservations":[{id:7,status:"active",phase:"ongoing",...}],
+#       "devices":[{deviceNo:"CENT-01",running:false,maintenanceDue:false,...}]}}
+
+# 2) 各区块首个有界历史页（默认 limit=20，固定 id 倒序）
+curl -s "$BASE/api/workbench/history/publications"
+# -> {"section":"publications","order":"id_desc","limit":20,
+#     "items":[{id:25,usable:true,...}, ... 共 20 条 ...],
+#     "hasMore":true,"nextBeforeId":6}
+
+# 3) 查看更早记录：把上一页的 nextBeforeId 作为 beforeId 逐页取回
+curl -s "$BASE/api/workbench/history/publications?beforeId=6"
+# -> {"items":[{id:5,...}], "hasMore":false,"nextBeforeId":null}  # 末页
+
+#    翻页稳定性：本轮以 nextBeforeId=6 继续期间，即使他人新发布了 #26/#27，
+#    服务端只返回 id < 6 的记录——本轮已有记录不重不漏；重新取首页（不带 beforeId）
+#    后 #27/#26 立即出现在最前。
+#    自定义页大小：?limit=50（1–100）。
+curl -s "$BASE/api/workbench/history/runs?limit=50"
+# -> 运行列表项为轻量字段：
+#    {"id":10,"runNo":"RUN-1","status":"running","phase":"running","timedOut":false,
+#     "startUtc":"...","endedAt":null,"frozenBasis":{
+#       "publication":{"id":1,"basisHash":"…","feasible":true,"currentlyUsable":true},
+#       "reservationCurrentStatus":"active"}, ...}
+#    完整冻结依据（装载图快照/核验判定/预约占用/校准依据）按需读取：
+curl -s $BASE/api/runs/10
+
+# 4) 其余区块同理（均可独立加载 / 失败单独重试）
+curl -s "$BASE/api/workbench/history/verifications"
+curl -s "$BASE/api/workbench/history/reservations"
+curl -s "$BASE/api/workbench/history/suspensions"
+curl -s "$BASE/api/workbench/history/maintenances"
+curl -s "$BASE/api/workbench/history/calibrations"
+curl -s "$BASE/api/workbench/history/items"
+curl -s "$BASE/api/workbench/history/checkouts"
+curl -s "$BASE/api/workbench/history/bookings"
+# 排班区块支持状态过滤（缺省返回全部状态）
+curl -s "$BASE/api/workbench/history/schedules?status=active"
+
+# 5) 错误约定
+curl -s -o /dev/null -w "%{http_code}\n" "$BASE/api/workbench/history/unknown"
+# -> 404（未知区块，响应 errors 中列出全部可用区块）
+curl -s -o /dev/null -w "%{http_code}\n" "$BASE/api/workbench/history/runs?limit=0"
+# -> 400（limit 必须是 1–100 的正整数）
+curl -s -o /dev/null -w "%{http_code}\n" "$BASE/api/workbench/history/runs?beforeId=abc"
+# -> 400（beforeId 必须是上一页返回的 nextBeforeId）
+
+# 6) 旧客户端仍可使用完整状态接口（响应字段保持不变）
+curl -s $BASE/api/state        # 含全部历史区块的完整响应
+```
+
+写入后刷新在界面上即「重新取概览 + 各区块首页」，所以**新记录在写入后的刷新中可见**；
+单区块接口失败只影响该区块的列表（显示重试条），配置编辑、其他区块操作与占用日程均
+不受影响。服务启动方式与环境变量不变（`npm start` / Docker Compose）。
+
 ## 目录结构
 
 ```
 src/
-  server.js     Express 服务与路由、原子发布/核验/预约/停用/排班/运行/保养/校准/实物领还事务
+  server.js     Express 服务与路由、原子发布/核验/预约/停用/排班/运行/保养/校准/实物领还事务；
+                工作台读取链路（/api/workbench/overview 概览 + /api/workbench/history/:section
+                有界键集翻页；旧 /api/state 与写入、详情接口保持兼容）
   db.js         SQLite 连接、建表（含固定孔位表、离心运行表、设备上限/保养/校准表、
                 配重实物与领用单表、预约排班表（部分唯一索引+非重叠触发器））、数据访问
   solver.js     求解器（含避邻对与固定孔位约束）、独立复核、数据指纹（纯函数，含测试）
@@ -1205,6 +1294,6 @@ src/
 public/         浏览器界面（原生 HTML/CSS/JS，无需构建）
 test/           node --test 测试（求解器 + 避邻对 + 固定孔位 + HTTP API + 核验
                 + 时段预约 + 临时停用 + 预约设备排班 + 找时段预约 + 离心运行
-                + 设备保养 + 设备校准 + 配重实物领还，共 208 项）
+                + 设备保养 + 设备校准 + 配重实物领还 + 工作台读取链路，共 227 项）
 Dockerfile / docker-compose.yml
 ```
