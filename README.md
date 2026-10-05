@@ -326,7 +326,9 @@ npm test
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/state` | 当前录入数据（含避邻对与固定孔位）、数据指纹、草稿（含是否过期）、发布列表、核验列表、预约与停用列表、离心运行列表（`runs`）、设备保养状态列表（`devices`，含每台设备最新校准）、保养记录列表（`maintenances`）、设备校准记录列表（`calibrations`）、配重实物列表（`items`）、领用单列表（`checkouts`）与**设备排班列表（`schedules`，含取消/改派历史）** |
+| GET | `/api/state` | 当前录入数据（含避邻对与固定孔位）、数据指纹、草稿（含是否过期）、发布列表、核验列表、预约与停用列表、离心运行列表（`runs`）、设备保养状态列表（`devices`，含每台设备最新校准）、保养记录列表（`maintenances`）、设备校准记录列表（`calibrations`）、配重实物列表（`items`）、领用单列表（`checkouts`）与**设备排班列表（`schedules`，含取消/改派历史）**。**完整响应保持不变，供旧客户端使用**；浏览器工作台已改走下方 `/api/workbench/*` 有界读取链路 |
+| GET | `/api/workbench/overview` | **工作台首屏 / 写入后刷新**：当前配置与数据指纹、草稿（含是否过期）、设备当前状态、可执行状态（`executable`：当前可用发布图、生效预约、已完成核验、进行中运行）与各历史区块（发布图/核验/预约/停用/运行/保养/校准）的**首个有界历史页**（默认每页 20 条）。某区块读取失败时该区块对象内带 `error`，其他区块不受影响 |
+| GET | `/api/workbench/sections/:section` | 单个历史区块的有界页（`section` 为 `publications`/`verifications`/`reservations`/`suspensions`/`runs`/`maintenances`/`calibrations`）；可加 `?limit=`（正整数，上限 100）与 `?cursor=`（上一页 `nextCursor`，不透明）。稳定顺序 `id DESC`（最新在前）；游标锚点固定本轮翻页开始前的最大 id，翻页期间新插入记录不进入本轮也不造成重复/遗漏，重新取首页后新记录可见。区块列表项的发布图可用性、预约/停用状态按**读取时现状**给出；运行列表只含冻结依据摘要，完整冻结快照仍读 `GET /api/runs/:id` |
 | PUT | `/api/config` | 整体替换转子配置（孔位数、容差、各孔最大承重），事务；缩小孔数使现有固定孔位越界时整次拒绝 |
 | PUT | `/api/tubes` | 整体替换全部离心管，事务，校验失败回滚；替换后若留下失效避邻对（对中管不再存在）或失效固定孔位（管不存在或孔位不再可用）拒绝并保留原数据 |
 | PUT | `/api/weights` | 整体替换全部配重规格，事务，校验失败回滚；库存缩减若使某规格数量低于其有效实物数（已登记未注销）则整次拒绝并保留原数据 |
@@ -398,6 +400,94 @@ npm test
 （被占用附 `checkoutId`、损坏、已注销），规格不匹配时 `detail.mismatches` 给出各规格
 「需 / 选」数量；归还整次拒绝时 `detail.notMine` / `detail.alreadyReturned` 分别列出
 非本单实物与重复归还实物。
+
+## 工作台读取链路（首屏概览 + 有界历史分页）HTTP API 调用示例
+
+发布图、核验、预约、停用与运行记录逐年累积，工作台刷新不再读取/渲染全部历史。
+本轮把读取链路调整为：
+
+- **首屏及单次写入后的刷新**只取一次 `GET /api/workbench/overview`：当前配置、
+  数据指纹、草稿、设备当前状态、发起操作所需的**可执行状态**（当前可用发布图、
+  生效预约、已完成核验、进行中运行），以及发布图/核验/预约/停用/运行/保养/校准
+  各区块的**首个有界历史页**（默认每页 20 条）。
+- **查看旧记录**时按稳定顺序（`id DESC`，最新在前）逐页取回；游标内带本轮锚点，
+  同一轮翻页期间即使插入新记录，本轮开始前已有记录也**不重复、不遗漏**；
+  重新取首页（下一轮刷新）后新记录自然出现在最前。
+- 列表中的**发布图当前可用性、预约与停用状态**按读取时现状给出；**运行的冻结依据
+  及历史记录不改写**（列表仅给冻结依据摘要，完整冻结快照按需读 `GET /api/runs/:id`）。
+- 某区块读取失败时可**单独重试**，其他区块及页面上未提交的编辑内容保持可用。
+- **旧客户端不受影响**：`GET /api/state` 仍返回完整全量响应，写入接口与各详情接口
+  的输入/状态码/幂等约定均未改动。
+
+```bash
+BASE=http://localhost:8080
+
+# 1) 首屏 / 写入后刷新：一次取当前配置、可执行状态与各区块首页（有界）
+curl -s $BASE/api/workbench/overview
+# -> {
+#      "data": {...当前录入...}, "currentHash": "sha256-...", "draft": {...},
+#      "devices": [...设备当前状态...],
+#      "executable": {
+#        "usablePublications": [ {...当前可用于装载的发布图（含 usable:true）...} ],
+#        "activeReservations": [ {...生效中预约（按读取时现状的 phase）...} ],
+#        "completedVerifications": [ {...已完成核验...} ],
+#        "runningRuns": [ {...进行中运行（冻结依据摘要）...} ] },
+#      "sections": {
+#        "publications":  {"section":"publications","items":[...20 条...],
+#                          "hasMore":true,"nextCursor":"eyJhIjoyNSwidCI6fQ","anchorId":25,"limit":20},
+#        "verifications": {...}, "reservations": {...}, "suspensions": {...},
+#        "runs": {...}, "maintenances": {...}, "calibrations": {...} },
+#      "defaultLimit": 20, "maxLimit": 100, "serverTime": "2026-10-05T..." }
+#
+# 说明：某个区块自身读取失败时，该区块对象为
+#   {"section":"runs","error":"...","items":[],"hasMore":false,"nextCursor":null,...}
+# 其他区块与 executable/data 不受影响；界面对该区块显示「重试此区块」。
+
+# 2) 翻到更早记录：带上一页返回的 nextCursor（不透明，原样回传即可）
+curl -s "$BASE/api/workbench/sections/publications?cursor=eyJhIjoyNSwidCI6fQ"
+# -> {"section":"publications","items":[...],"hasMore":true,
+#     "nextCursor":"...下一页游标...","anchorId":25,"limit":20}
+# 继续翻页直到 hasMore=false（nextCursor=null）。
+
+# 2b) 游标锚点固定「本轮开始前」的范围：
+#     首页 anchorId=25；翻页途中新写入发布图 #26/#27，继续用上一页游标取回的仍是
+#     id<=25 的旧记录（不会突然插入 #26，也不会漏掉或重复 #25 及更早的记录）；
+#     本轮取完后重新请求首页（不带 cursor）→ anchorId 前移，#26/#27 立即可见。
+
+# 3) 指定页大小（正整数，上限 100；超过按 100 处理）
+curl -s "$BASE/api/workbench/sections/runs?limit=50"
+curl -s "$BASE/api/workbench/sections/runs?limit=50&cursor=..."   # 同样可带游标
+
+# 4) 其他区块（与上面同构）
+curl -s $BASE/api/workbench/sections/verifications
+curl -s $BASE/api/workbench/sections/reservations
+curl -s $BASE/api/workbench/sections/suspensions
+curl -s $BASE/api/workbench/sections/maintenances
+curl -s $BASE/api/workbench/sections/calibrations
+
+# 5) 参数错误
+curl -s "$BASE/api/workbench/sections/runs?limit=0"
+# -> 400 {"errors":["limit 必须是正整数"]}
+curl -s "$BASE/api/workbench/sections/runs?cursor=bad"
+# -> 400 {"errors":["cursor 不合法"]}
+curl -s "$BASE/api/workbench/sections/unknown"
+# -> 404 {"error":"未知工作台区块：unknown"}
+```
+
+分页对象字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `items` | 本页记录（稳定顺序 `id DESC`，最新在前；字段与旧列表项一致） |
+| `hasMore` | 是否还有更早的下一页 |
+| `nextCursor` | 下一页游标；`hasMore=false` 时为 `null`。不透明字符串，客户端原样回传即可 |
+| `anchorId` | 本轮锚点（首页时该区块最大 id）；同一轮翻页保持不变，保证不重复/不遗漏 |
+| `limit` | 本页实际采用的页大小 |
+| `error` | 仅在 overview 内某区块单独失败时出现（该项可单独重试；其余区块照常） |
+
+注意：运行区块列表项的 `frozenBasis` 只含**摘要**（发布图 id/哈希/当前可用性、
+冻结预约时段、预约当前状态），不再下发完整冻结配置/装载图/逐孔判定——这些仍在
+`GET /api/runs/:id` 详情中按需返回；发布图、核验、预约、停用详情接口保持原约定。
 
 ## 避邻对 HTTP API 调用示例
 
@@ -1183,9 +1273,12 @@ curl -s $BASE/api/bookings/1
 
 ```
 src/
-  server.js     Express 服务与路由、原子发布/核验/预约/停用/排班/运行/保养/校准/实物领还事务
+  server.js     Express 服务与路由、原子发布/核验/预约/停用/排班/运行/保养/校准/实物领还事务、
+                工作台读取链路（/api/workbench/overview 概览 + /api/workbench/sections/*
+                有界历史分页，游标锚点稳定；/api/state 完整响应保留给旧客户端）
   db.js         SQLite 连接、建表（含固定孔位表、离心运行表、设备上限/保养/校准表、
-                配重实物与领用单表、预约排班表（部分唯一索引+非重叠触发器））、数据访问
+                配重实物与领用单表、预约排班表（部分唯一索引+非重叠触发器））、数据访问、
+                工作台稳定顺序分页查询（id DESC + 锚点游标）
   solver.js     求解器（含避邻对与固定孔位约束）、独立复核、数据指纹（纯函数，含测试）
   verify.js     现场核验：录入规整、进度、完成判定（纯函数，含测试）
   reserve.js    时段预约与临时停用：UTC 解析、冻结图占用、双层扫描线（占用+停用）
@@ -1205,6 +1298,7 @@ src/
 public/         浏览器界面（原生 HTML/CSS/JS，无需构建）
 test/           node --test 测试（求解器 + 避邻对 + 固定孔位 + HTTP API + 核验
                 + 时段预约 + 临时停用 + 预约设备排班 + 找时段预约 + 离心运行
-                + 设备保养 + 设备校准 + 配重实物领还，共 208 项）
+                + 设备保养 + 设备校准 + 配重实物领还 + 工作台有界分页（锚点稳定、
+                区块隔离、/api/state 兼容），共 222 项）
 Dockerfile / docker-compose.yml
 ```

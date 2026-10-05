@@ -85,6 +85,8 @@ import {
   getBookingRowByBatch,
   listBookingRows,
   insertBooking,
+  workbenchPageRows,
+  workbenchMaxId,
 } from './db.js';
 import { solve, verify, computeHash } from './solver.js';
 import { normalizeEntries, measureProgress, verifyMeasurements } from './verify.js';
@@ -187,6 +189,267 @@ export function createApp(db) {
       schedules: listScheduleRows(db).map((r) => scheduleView(r, Date.now())),
       bookings: listBookingRows(db).map(bookingView),
     });
+  });
+
+  // ---------- 工作台读取链路（首屏概览 + 各区块有界历史分页） ----------
+  //
+  // 旧客户端继续使用 GET /api/state（完整响应保持不变）。工作台首屏及单次写入后的
+  // 刷新改走：
+  //   GET /api/workbench/overview
+  //     —— 当前配置/数据指纹/草稿、可执行状态（可用于当前装载的发布图、生效预约、
+  //        已完成核验、进行中运行、设备当前状态）与各历史区块的首个有界页；
+  //   GET /api/workbench/sections/:section?limit=&cursor=
+  //     —— 各区块独立翻页/单独重试；稳定顺序 id DESC（最新在前），游标内的锚点
+  //        固定本轮翻页开始前的最大 id，期间新插入的记录不进入本轮、也不造成重复遗漏。
+  // 区块列表项的可用性/预约/停用/运行状态均按「读取时」现状计算；运行的冻结依据与
+  // 历史记录不改写（列表仅给冻结依据摘要，完整冻结快照仍按需读详情接口）。
+  const WORKBENCH_DEFAULT_LIMIT = 20;
+  const WORKBENCH_MAX_LIMIT = 100;
+  const WORKBENCH_SECTION_NAMES = [
+    'publications',
+    'verifications',
+    'reservations',
+    'suspensions',
+    'runs',
+    'maintenances',
+    'calibrations',
+  ];
+
+  // 游标为不透明 base64url(JSON)：a = 本轮锚点（首页时的最大 id），
+  // t = 上一页最末条 id（下一页取 id < t）。
+  function encodeWorkbenchCursor({ anchorId, afterId }) {
+    return Buffer.from(JSON.stringify({ a: anchorId, t: afterId }), 'utf8').toString(
+      'base64url',
+    );
+  }
+
+  function decodeWorkbenchCursor(raw) {
+    let obj;
+    try {
+      obj = JSON.parse(Buffer.from(String(raw), 'base64url').toString('utf8'));
+    } catch {
+      return null;
+    }
+    if (!obj || typeof obj !== 'object') return null;
+    if (!Number.isInteger(obj.a) || obj.a <= 0) return null;
+    if (obj.t != null && (!Number.isInteger(obj.t) || obj.t <= 0)) return null;
+    return { anchorId: obj.a, afterId: obj.t ?? null };
+  }
+
+  function publicationSummaryFromRow(row, hash) {
+    return {
+      id: row.id,
+      createdAt: row.created_at,
+      basisHash: row.basis_hash,
+      feasible: !!row.feasible,
+      weightCount: row.weight_count,
+      diffSum: row.diff_sum,
+      reasons: row.reasons ? JSON.parse(row.reasons) : [],
+      usable: hash !== null && !!row.feasible && row.basis_hash === hash,
+    };
+  }
+
+  // 运行列表项：与 runView 相同的读取时现状字段，但不解析/下发冻结的完整配置、
+  // 装载图与逐孔核验判定（那些只在 GET /api/runs/:id 详情中按需返回）。
+  function runListItemView(row, hash, nowMs) {
+    const ended = !!row.ended_at;
+    const reservationEndMs = Date.parse(row.frozen_reservation_end_utc);
+    const reservationStartMs = Date.parse(row.frozen_reservation_start_utc);
+    const view = {
+      id: row.id,
+      runNo: row.run_no,
+      deviceNo: row.device_no,
+      verificationId: row.verification_id,
+      reservationId: row.reservation_id,
+      publicationId: row.publication_id,
+      status: ended ? row.outcome : 'running',
+      outcome: ended ? row.outcome : null,
+      timedOut: !!row.timed_out,
+      startUtc: row.start_utc,
+      endedAt: row.ended_at,
+      createdAt: row.created_at,
+      phase: ended
+        ? 'ended'
+        : nowMs >= reservationEndMs
+          ? 'overrunning'
+          : 'running',
+      // 冻结依据摘要（开始时写入，之后永不改写；当前可用性仅读取时展示）。
+      frozenBasis: {
+        publication: {
+          id: row.publication_id,
+          basisHash: row.frozen_basis_hash,
+          feasible: !!row.frozen_pub_feasible,
+          currentlyUsable:
+            hash !== null &&
+            !!row.frozen_pub_feasible &&
+            row.frozen_basis_hash === hash,
+        },
+        reservation: {
+          id: row.reservation_id,
+          startUtc: row.frozen_reservation_start_utc,
+          endUtc: row.frozen_reservation_end_utc,
+          usage: JSON.parse(row.frozen_reservation_usage_json),
+        },
+        reservationCurrentStatus: null,
+      },
+    };
+    const resRow = getReservationRow(db, row.reservation_id);
+    if (resRow) view.frozenBasis.reservationCurrentStatus = resRow.status;
+    if (!ended) {
+      view.withinReservationWindow = isWithinReservation(
+        reservationStartMs,
+        reservationEndMs,
+        nowMs,
+      );
+    }
+    return view;
+  }
+
+  function workbenchRowView(section, row, hash, nowMs) {
+    switch (section) {
+      case 'publications':
+        return publicationSummaryFromRow(row, hash);
+      case 'verifications':
+        return verificationSummary(row, hash);
+      case 'reservations':
+        return reservationView(row, hash, nowMs);
+      case 'suspensions':
+        return suspensionView(row, nowMs);
+      case 'runs':
+        return runListItemView(row, hash, nowMs);
+      case 'maintenances':
+        return maintenanceView(row);
+      case 'calibrations':
+        return calibrationView(row, nowMs);
+      default:
+        throw new ValidationError([`未知工作台区块：${section}`]);
+    }
+  }
+
+  function buildWorkbenchPage(section, { limit, anchorId, afterId }, hash, nowMs) {
+    const rows = workbenchPageRows(db, section, {
+      fetchLimit: limit + 1,
+      anchorId,
+      afterId,
+    });
+    const hasMore = rows.length > limit;
+    const pageRows = hasMore ? rows.slice(0, limit) : rows;
+    // 首页（无游标）时锚点取读取时刻该区块最大 id，固定本轮翻页的快照范围。
+    const anchor = anchorId != null ? anchorId : workbenchMaxId(db, section);
+    const items = pageRows.map((r) => workbenchRowView(section, r, hash, nowMs));
+    const lastId = pageRows.length ? pageRows[pageRows.length - 1].id : null;
+    const nextCursor =
+      hasMore && lastId != null
+        ? encodeWorkbenchCursor({ anchorId: anchor, afterId: lastId })
+        : null;
+    return { section, items, hasMore, nextCursor, anchorId: anchor, limit };
+  }
+
+  // 概览中的区块相互隔离：任一区块读取/序列化失败只在该区块给出 error，
+  // 不影响当前配置、可执行状态与其他区块（前端据此显示「重试此区块」）。
+  function buildWorkbenchPageSafe(section, pageArgs, hash, nowMs) {
+    try {
+      return buildWorkbenchPage(section, pageArgs, hash, nowMs);
+    } catch (e) {
+      return {
+        section,
+        error: e && e.message ? e.message : '该区块读取失败',
+        items: [],
+        hasMore: false,
+        nextCursor: null,
+        anchorId: null,
+        limit: pageArgs.limit,
+      };
+    }
+  }
+
+  app.get('/api/workbench/overview', (req, res) => {
+    const nowMs = Date.now();
+    const data = loadData(db);
+    const hash = data ? computeHash(data) : null;
+    const rawDraft = getDraft(db);
+    let draft = null;
+    if (rawDraft) {
+      draft = {
+        ...rawDraft,
+        stale: hash === null || rawDraft.basisHash !== hash,
+      };
+    }
+    const limit = WORKBENCH_DEFAULT_LIMIT;
+    const sections = {};
+    for (const section of WORKBENCH_SECTION_NAMES) {
+      sections[section] = buildWorkbenchPageSafe(
+        section,
+        { limit, anchorId: null, afterId: null },
+        hash,
+        nowMs,
+      );
+    }
+    // 可执行状态：工作台发起操作所需的「读取时现状」清单（均为当前有效子集，
+    // 数据量受当前配置约束而非随历史累积）。
+    const usablePublications = listPublications(db)
+      .map((p) => ({ ...p, usable: hash !== null && p.feasible && p.basisHash === hash }))
+      .filter((p) => p.usable);
+    const activeReservations = listReservationRows(db)
+      .filter((r) => r.status === 'active')
+      .map((r) => reservationView(r, hash, nowMs));
+    const completedVerifications = listVerificationRows(db)
+      .filter((r) => r.completed_at)
+      .map((r) => verificationSummary(r, hash));
+    const runningRuns = listRunRows(db)
+      .filter((r) => !r.ended_at)
+      .map((r) => runListItemView(r, hash, nowMs));
+    res.json({
+      data,
+      currentHash: hash,
+      draft,
+      // 设备当前状态（空闲/运行中、最新校准、保养额度）属于可执行状态而非历史。
+      devices: listDeviceViews(db),
+      executable: {
+        usablePublications,
+        activeReservations,
+        completedVerifications,
+        runningRuns,
+      },
+      sections,
+      defaultLimit: limit,
+      maxLimit: WORKBENCH_MAX_LIMIT,
+      serverTime: toIso(nowMs),
+    });
+  });
+
+  app.get('/api/workbench/sections/:section', (req, res, next) => {
+    try {
+      const section = req.params.section;
+      if (!WORKBENCH_SECTION_NAMES.includes(section)) {
+        return res.status(404).json({ error: `未知工作台区块：${section}` });
+      }
+      let limit = WORKBENCH_DEFAULT_LIMIT;
+      if (req.query.limit !== undefined) {
+        const n = Number(req.query.limit);
+        if (!Number.isInteger(n) || n <= 0) {
+          throw new ValidationError(['limit 必须是正整数']);
+        }
+        limit = Math.min(n, WORKBENCH_MAX_LIMIT);
+      }
+      let anchorId = null;
+      let afterId = null;
+      if (req.query.cursor !== undefined) {
+        const decoded = decodeWorkbenchCursor(req.query.cursor);
+        if (!decoded) throw new ValidationError(['cursor 不合法']);
+        anchorId = decoded.anchorId;
+        afterId = decoded.afterId;
+      }
+      const page = buildWorkbenchPage(
+        section,
+        { limit, anchorId, afterId },
+        currentHash(db),
+        Date.now(),
+      );
+      res.json(page);
+    } catch (e) {
+      next(e);
+    }
   });
 
   // ---------- 转子配置（整体替换，事务） ----------

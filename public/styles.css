@@ -101,6 +101,10 @@ input[type="number"]:focus, input[type="text"]:focus, select:focus {
   gap: 10px;
   flex-wrap: wrap;
 }
+.actions.pager {
+  justify-content: center;
+  margin-top: 12px;
+}
 button {
   padding: 8px 16px;
   border-radius: 6px;

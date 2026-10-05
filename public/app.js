@@ -9,7 +9,21 @@ for (let n = 4; n <= 12; n += 2) {
   holesSel.appendChild(opt);
 }
 
-let state = null; // GET /api/state 的完整响应
+let overview = null; // GET /api/workbench/overview：当前配置、可执行状态与各区块首页
+// 各历史区块的独立读取状态（某区块读取失败不影响其他区块与未提交的编辑内容）。
+// key = publications/verifications/reservations/suspensions/runs/maintenances/calibrations
+// 值：{ status:'loading'|'ready'|'error', items, hasMore, nextCursor, anchorId, loadingMore, error }
+const sectionState = new Map();
+const SECTION_NAMES = [
+  'publications',
+  'verifications',
+  'reservations',
+  'suspensions',
+  'runs',
+  'maintenances',
+  'calibrations',
+];
+for (const name of SECTION_NAMES) sectionState.set(name, { status: 'loading' });
 // 编辑区本地缓冲
 let editorN = null;
 let tubeRows = []; // {id, mass, holes:Set}
@@ -46,22 +60,123 @@ async function api(method, url, body) {
 }
 const fmt = (x) => (typeof x === 'number' ? String(Math.round(x * 1e6) / 1e6) : x);
 
-// ---------- 数据刷新 ----------
+// ---------- 工作台读取链路 ----------
+//
+// 首屏及单次写入后的刷新：只取 /api/workbench/overview（当前配置、可执行状态、
+// 各区块首个有界页），再并行刷新各区块首页；某区块失败只在该区块显示「重试」，
+// 其他区块与未提交的编辑内容保持可用。查看旧记录用「载入更早记录」按稳定顺序
+// 逐页取回（游标内锚点固定本轮开始前的最大 id，翻页期间新插入记录不重复/遗漏，
+// 下一轮首页刷新后新记录自然出现在最前）。
+async function loadSectionFirstPage(name) {
+  const prev = sectionState.get(name) || {};
+  // 已有内容时保留旧内容（如单独重试/写入后刷新），仅标记正在读取；
+  // 首次加载（无内容）才显示占位加载态。
+  sectionState.set(name, {
+    status: 'loading',
+    items: prev.items || [],
+    hasMore: prev.hasMore || false,
+    nextCursor: prev.nextCursor || null,
+    anchorId: prev.anchorId ?? null,
+  });
+  renderSection(name);
+  try {
+    const page = await api('GET', `/api/workbench/sections/${name}`);
+    sectionState.set(name, {
+      status: 'ready',
+      items: page.items,
+      hasMore: page.hasMore,
+      nextCursor: page.nextCursor,
+      anchorId: page.anchorId,
+    });
+    renderSection(name);
+  } catch (e) {
+    sectionState.set(name, {
+      status: 'error',
+      items: prev.items || [],
+      hasMore: prev.hasMore || false,
+      nextCursor: prev.nextCursor || null,
+      anchorId: prev.anchorId ?? null,
+      error: e.message,
+    });
+    renderSection(name);
+  }
+}
+
+async function loadSectionMore(name) {
+  const cur = sectionState.get(name);
+  if (!cur || cur.status !== 'ready' || !cur.hasMore || cur.loadingMore || !cur.nextCursor) {
+    return;
+  }
+  sectionState.set(name, { ...cur, loadingMore: true });
+  renderSection(name);
+  try {
+    const page = await api(
+      'GET',
+      `/api/workbench/sections/${name}?cursor=${encodeURIComponent(cur.nextCursor)}`,
+    );
+    const merged = sectionState.get(name);
+    sectionState.set(name, {
+      status: 'ready',
+      items: merged.items.concat(page.items),
+      hasMore: page.hasMore,
+      nextCursor: page.nextCursor,
+      anchorId: page.anchorId,
+      loadingMore: false,
+    });
+    renderSection(name);
+  } catch (e) {
+    const merged = sectionState.get(name);
+    sectionState.set(name, {
+      ...merged,
+      loadingMore: false,
+      moreError: e.message,
+    });
+    renderSection(name);
+  }
+}
 
 async function refresh(flash) {
-  state = await api('GET', '/api/state');
-  renderAll();
+  overview = await api('GET', '/api/workbench/overview');
+  renderOverview();
+  // 各区块首页并行、彼此独立：首页结果直接采用 overview 中已带的首个有界页，
+  // 失败时单独再取对应区块接口（二者字段同构），保证区块级隔离与可重试。
+  // 各区块首页彼此独立：overview 中某区块自带 error 时只在该区块显示重试，
+  // 其他区块与未提交编辑内容不受影响。
+  for (const name of SECTION_NAMES) {
+    const page = overview.sections[name];
+    if (page && page.error) {
+      sectionState.set(name, {
+        status: 'error',
+        items: [],
+        hasMore: false,
+        nextCursor: null,
+        anchorId: null,
+        error: page.error,
+      });
+    } else {
+      sectionState.set(name, {
+        status: 'ready',
+        items: page.items,
+        hasMore: page.hasMore,
+        nextCursor: page.nextCursor,
+        anchorId: page.anchorId,
+      });
+    }
+    renderSection(name);
+  }
+  // 占用日程是预约区块的旁路读取（无界历史），失败不影响其他区块。
+  loadSchedule().catch(() => {});
   if (flash) showAlert(flash, 'ok');
   else clearAlert();
 }
 
-function renderAll() {
-  const d = state.data;
-  $('#hashline').textContent = state.currentHash
-    ? `当前数据指纹 sha256:${state.currentHash.slice(0, 16)}…`
+function renderOverview() {
+  const d = overview.data;
+  $('#hashline').textContent = overview.currentHash
+    ? `当前数据指纹 sha256:${overview.currentHash.slice(0, 16)}…`
     : '尚未配置转子';
 
-  // 首次或孔位数变化时重建本地编辑缓冲
+  // 首次或孔位数变化时重建本地编辑缓冲（写入后刷新若孔位数不变，保留未提交编辑）
   const N = d ? d.holes : null;
   if (editorN !== N) {
     editorN = N;
@@ -88,15 +203,93 @@ function renderAll() {
   renderFixedTable();
   renderWeightTable();
   renderDraft();
-  renderPublications();
-  renderVerifications();
-  renderReservations();
-  renderSuspensions();
-  renderRuns();
   renderDevices();
-  renderMaintenances();
-  renderCalibrations();
+  // 各操作表单的可选项来自「当前配置 / 可执行状态」（不随历史区块分页变化）。
+  renderReservationForm();
+  renderSuspensionForm();
+  renderRunForm();
 }
+
+// 区块容器的统一壳：加载/错误/重试/「载入更早记录」分页条由这里负责，
+// 区块自身的列表 HTML 由 contentFn(items) 生成。
+function renderSectionShell(name, containerId, contentFn, emptyText) {
+  const box = $(containerId);
+  const st = sectionState.get(name);
+  let html = '';
+  if (st.status === 'loading' && (!st.items || st.items.length === 0)) {
+    html = '<div class="muted">读取中…</div>';
+  } else if (st.status === 'error' && (!st.items || st.items.length === 0)) {
+    html = `<div class="banner bad">该区块读取失败：${escapeHtml(st.error || '未知错误')}
+      <div class="actions" style="margin:8px 0 0">
+        <button data-section-retry="${name}" class="primary">重试此区块</button>
+      </div></div>`;
+  } else if ((!st.items || st.items.length === 0)) {
+    html = `<div class="muted">${emptyText}</div>`;
+  } else {
+    html = contentFn(st.items);
+  }
+  if (st.items && st.items.length) {
+    if (st.status === 'error') {
+      html += `<div class="banner bad">读取失败（上方为上次成功取得的记录）：${escapeHtml(st.error || '')}
+        <div class="actions" style="margin:8px 0 0">
+          <button data-section-retry="${name}" class="primary">重试此区块</button>
+        </div></div>`;
+    }
+    if (st.hasMore) {
+      html += `<div class="actions pager">
+        <button data-section-more="${name}" ${st.loadingMore ? 'disabled' : ''}>
+          ${st.loadingMore ? '读取中…' : '载入更早记录'}
+        </button></div>`;
+    }
+    if (st.moreError) {
+      html += `<div class="banner bad">更早记录读取失败：${escapeHtml(st.moreError)}
+        <div class="actions" style="margin:8px 0 0">
+          <button data-section-more="${name}" class="primary">重试</button>
+        </div></div>`;
+    }
+  }
+  box.innerHTML = html;
+  box.querySelectorAll('[data-section-retry]').forEach((b) =>
+    b.addEventListener('click', () => loadSectionFirstPage(name)),
+  );
+  box.querySelectorAll('[data-section-more]').forEach((b) =>
+    b.addEventListener('click', () => loadSectionMore(name)),
+  );
+}
+
+function renderSection(name) {
+  switch (name) {
+    case 'publications':
+      renderSectionShell('publications', '#pub-list', publicationsContent, '暂无发布记录。');
+      bindPublicationRows($('#pub-list'));
+      break;
+    case 'verifications':
+      renderSectionShell('verifications', '#verify-list', verificationsContent,
+        '尚无核验记录。在第 7 节对可用于当前装载的发布记录点「现场核验此图」即可开始。');
+      bindVerificationRows($('#verify-list'));
+      break;
+    case 'reservations':
+      renderReservationsShell();
+      break;
+    case 'suspensions':
+      renderSectionShell('suspensions', '#sus-list', suspensionsContent, '暂无停用记录。');
+      bindSuspensionRows($('#sus-list'));
+      break;
+    case 'runs':
+      renderSectionShell('runs', '#run-list', runsContent, '暂无运行记录。');
+      bindRunRows($('#run-list'));
+      break;
+    case 'maintenances':
+      renderSectionShell('maintenances', '#maint-list', maintenancesContent, '暂无保养记录。');
+      break;
+    case 'calibrations':
+      renderSectionShell('calibrations', '#calib-list', calibrationsContent, '暂无校准记录。');
+      break;
+    default:
+      break;
+  }
+}
+
 
 function renderHoleMax(d) {
   const N = d ? d.holes : Number(holesSel.value);
@@ -194,7 +387,7 @@ $('#add-tube').addEventListener('click', () => {
 function tubeIdOptions(selected) {
   // 下拉选项来自已保存的离心管（服务端按已保存数据校验）；
   // 当前值不在其中时保留原值并标记（保存时会被服务端拒绝）。
-  const ids = state.data ? state.data.tubes.map((t) => t.id) : [];
+  const ids = overview.data ? overview.data.tubes.map((t) => t.id) : [];
   const opts = ['<option value="">（选择离心管）</option>'];
   for (const id of ids) {
     opts.push(
@@ -240,7 +433,7 @@ function renderExclusionTable() {
 }
 
 $('#add-exclusion').addEventListener('click', () => {
-  if (!state.data) return showAlert('请先保存转子配置并录入离心管。', 'err');
+  if (!overview.data) return showAlert('请先保存转子配置并录入离心管。', 'err');
   exclRows.push({ a: '', b: '' });
   renderExclusionTable();
 });
@@ -259,7 +452,7 @@ $('#save-exclusions').addEventListener('click', async () => {
 
 function holeOptions(selected) {
   // 下拉选项为当前孔位 0..N-1；当前值越界时保留原值并标记（保存时会被服务端拒绝）
-  const N = state.data ? state.data.holes : editorN;
+  const N = overview.data ? overview.data.holes : editorN;
   const opts = ['<option value="">（选择孔位）</option>'];
   for (let h = 0; h < N; h += 1) {
     opts.push(`<option value="${h}"${h === selected ? ' selected' : ''}>${h}</option>`);
@@ -303,7 +496,7 @@ function renderFixedTable() {
 }
 
 $('#add-fixed').addEventListener('click', () => {
-  if (!state.data) return showAlert('请先保存转子配置并录入离心管。', 'err');
+  if (!overview.data) return showAlert('请先保存转子配置并录入离心管。', 'err');
   fixedRows.push({ tube: '', hole: '' });
   renderFixedTable();
 });
@@ -447,7 +640,7 @@ function arrangementHtml(result) {
 }
 
 function renderDraft() {
-  const draft = state.draft;
+  const draft = overview.draft;
   const staleBox = $('#draft-stale');
   const noneBox = $('#draft-none');
   const body = $('#draft-body');
@@ -472,8 +665,8 @@ function renderDraft() {
     return;
   }
   const r = draft.result;
-  const excl = state.data && state.data.exclusionPairs ? state.data.exclusionPairs : [];
-  const fixed = state.data && state.data.fixedSlots ? state.data.fixedSlots : [];
+  const excl = overview.data && overview.data.exclusionPairs ? overview.data.exclusionPairs : [];
+  const fixed = overview.data && overview.data.fixedSlots ? overview.data.fixedSlots : [];
   body.innerHTML = `
     <div class="metrics">
       <div>使用配重块：<b>${r.weightCount}</b> 枚（已最小化）</div>
@@ -503,13 +696,8 @@ $('#publish').addEventListener('click', async () => {
 
 // ---------- 发布历史 ----------
 
-function renderPublications() {
-  const box = $('#pub-list');
-  if (state.publications.length === 0) {
-    box.innerHTML = '<div class="muted">暂无发布记录。</div>';
-    return;
-  }
-  box.innerHTML = state.publications
+function publicationsContent(list) {
+  return list
     .map(
       (p) => `<div class="pub-row">
         <div>
@@ -532,6 +720,9 @@ function renderPublications() {
       </div>`,
     )
     .join('');
+}
+
+function bindPublicationRows(box) {
   box.querySelectorAll('.pub-view').forEach((b) =>
     b.addEventListener('click', () => openPublication(Number(b.dataset.pub))),
   );
@@ -584,15 +775,8 @@ function escapeHtml(s) {
 
 let verDetail = null; // GET /api/verifications/:id 的完整响应（编辑器数据源）
 
-function renderVerifications() {
-  const box = $('#verify-list');
-  const list = state.verifications || [];
-  if (list.length === 0) {
-    box.innerHTML =
-      '<div class="muted">尚无核验记录。在第 7 节对可用于当前装载的发布记录点「现场核验此图」即可开始。</div>';
-    return;
-  }
-  box.innerHTML = list
+function verificationsContent(list) {
+  return list
     .map(
       (v) => `<div class="pub-row">
         <div>
@@ -611,6 +795,9 @@ function renderVerifications() {
       </div>`,
     )
     .join('');
+}
+
+function bindVerificationRows(box) {
   box.querySelectorAll('[data-ver]').forEach((b) =>
     b.addEventListener('click', () => openVerification(Number(b.dataset.ver))),
   );
@@ -881,10 +1068,10 @@ function usageText(usage) {
   return usage.map((u) => `${u.mass} g × ${u.count}`).join('，');
 }
 
-function renderReservations() {
-  // 预约表单：可选发布图（仅当前可用）
+// 预约区块：表单下拉（可执行状态）+ 有界历史列表壳 + 取消绑定。
+function renderReservationForm() {
   const sel = $('#res-pub');
-  const usable = state.publications.filter((p) => p.usable);
+  const usable = overview.executable.usablePublications;
   const prev = sel.value;
   sel.innerHTML = usable.length
     ? usable
@@ -895,14 +1082,10 @@ function renderReservations() {
         .join('')
     : '<option value="">（暂无可用发布图）</option>';
   if (usable.some((p) => String(p.id) === prev)) sel.value = prev;
+}
 
-  // 预约列表
-  const box = $('#res-list');
-  const list = state.reservations || [];
-  if (list.length === 0) {
-    box.innerHTML = '<div class="muted">暂无预约记录。</div>';
-  } else {
-    box.innerHTML = `<div class="table-wrap"><table class="res-table">
+function reservationsContent(list) {
+  return `<div class="table-wrap"><table class="res-table">
       <thead><tr>
         <th>批次号</th><th>依据图</th><th>时段（UTC，左闭右开）</th><th>占用规格</th>
         <th>状态</th><th>依据图当前可用</th><th></th>
@@ -929,16 +1112,37 @@ function renderReservations() {
       </tr>`,
         )
         .join('')}</tbody></table></div>`;
-    box.querySelectorAll('[data-res-cancel]').forEach((b) =>
-      b.addEventListener('click', () => cancelReservation(Number(b.dataset.resCancel))),
-    );
-  }
+}
 
-  loadSchedule().catch(() => {});
+function bindReservationRows(box) {
+  box.querySelectorAll('[data-res-cancel]').forEach((b) =>
+    b.addEventListener('click', () => cancelReservation(Number(b.dataset.resCancel))),
+  );
+}
+
+function renderReservationsShell() {
+  // 预约表单下拉已在 renderOverview() 按可执行状态渲染；这里只渲染有界历史列表。
+  renderSectionShell(
+    'reservations',
+    '#res-list',
+    reservationsContent,
+    '暂无预约记录。',
+  );
+  bindReservationRows($('#res-list'));
 }
 
 async function loadSchedule() {
-  const sch = await api('GET', '/api/schedule');
+  let sch;
+  try {
+    sch = await api('GET', '/api/schedule');
+  } catch (e) {
+    $('#res-schedule').innerHTML = `<div class="banner bad">占用日程读取失败：${escapeHtml(e.message)}
+      <div class="actions" style="margin:8px 0 0">
+        <button id="res-schedule-retry" class="primary">重试占用日程</button>
+      </div></div>`;
+    $('#res-schedule-retry').addEventListener('click', () => loadSchedule().catch(() => {}));
+    return;
+  }
   const box = $('#res-schedule');
   if (!sch.specs || sch.specs.length === 0) {
     box.innerHTML = '<div class="muted">当前无生效中的预约占用或停用。</div>';
@@ -1048,10 +1252,10 @@ const SUS_PHASE_LABEL = {
   revoked: '已撤销',
 };
 
-function renderSuspensions() {
+function renderSuspensionForm() {
   // 规格下拉：仅当前录入规格
   const sel = $('#sus-mass');
-  const weights = (state.data && state.data.weights) || [];
+  const weights = ((overview.data && overview.data.weights)) || [];
   const prev = sel.value;
   sel.innerHTML = weights.length
     ? weights
@@ -1059,14 +1263,10 @@ function renderSuspensions() {
         .join('')
     : '<option value="">（请先在第 5 节录入配重规格）</option>';
   if (weights.some((w) => String(w.mass) === prev)) sel.value = prev;
+}
 
-  const box = $('#sus-list');
-  const list = state.suspensions || [];
-  if (list.length === 0) {
-    box.innerHTML = '<div class="muted">暂无停用记录。</div>';
-    return;
-  }
-  box.innerHTML = `<div class="table-wrap"><table class="res-table">
+function suspensionsContent(list) {
+  return `<div class="table-wrap"><table class="res-table">
     <thead><tr>
       <th>规格</th><th>停用数量</th><th>原因</th><th>时段（UTC，左闭右开）</th>
       <th>状态</th><th></th>
@@ -1088,6 +1288,9 @@ function renderSuspensions() {
     </tr>`,
       )
       .join('')}</tbody></table></div>`;
+}
+
+function bindSuspensionRows(box) {
   box.querySelectorAll('[data-sus-revoke]').forEach((b) =>
     b.addEventListener('click', () => revokeSuspension(Number(b.dataset.susRevoke))),
   );
@@ -1151,10 +1354,10 @@ const RUN_STATUS_LABEL = {
   aborted: '已中止',
 };
 
-function renderRuns() {
-  // 核验下拉：仅展示已完成核验（未完成草稿不能开始运行）
+function renderRunForm() {
+  // 核验下拉：仅展示已完成核验（未完成草稿不能开始运行）——可执行状态
   const verSel = $('#run-ver');
-  const verList = (state.verifications || []).filter((v) => v.completed);
+  const verList = overview.executable.completedVerifications;
   const verPrev = verSel.value;
   verSel.innerHTML = verList.length
     ? verList
@@ -1166,9 +1369,9 @@ function renderRuns() {
     : '<option value="">（暂无已完成核验）</option>';
   if (verList.some((v) => String(v.id) === verPrev)) verSel.value = verPrev;
 
-  // 预约下拉：仅展示生效中预约（已取消不能开始运行）
+  // 预约下拉：仅展示生效中预约（已取消不能开始运行）——可执行状态
   const resSel = $('#run-res');
-  const resList = (state.reservations || []).filter((r) => r.status === 'active');
+  const resList = overview.executable.activeReservations;
   const resPrev = resSel.value;
   resSel.innerHTML = resList.length
     ? resList
@@ -1179,14 +1382,10 @@ function renderRuns() {
         .join('')
     : '<option value="">（暂无生效中预约）</option>';
   if (resList.some((r) => String(r.id) === resPrev)) resSel.value = resPrev;
+}
 
-  const box = $('#run-list');
-  const list = state.runs || [];
-  if (list.length === 0) {
-    box.innerHTML = '<div class="muted">暂无运行记录。</div>';
-    return;
-  }
-  box.innerHTML = `<div class="table-wrap"><table class="res-table">
+function runsContent(list) {
+  return `<div class="table-wrap"><table class="res-table">
     <thead><tr>
       <th>运行编号</th><th>设备</th><th>状态</th><th>超时</th>
       <th>开始 / 结束（UTC，服务端记录）</th><th>核验 / 预约 / 发布图</th>
@@ -1233,6 +1432,9 @@ function renderRuns() {
     </tr>`,
       )
       .join('')}</tbody></table></div>`;
+}
+
+function bindRunRows(box) {
   box.querySelectorAll('[data-run-view]').forEach((b) =>
     b.addEventListener('click', () => openRun(Number(b.dataset.runView))),
   );
@@ -1380,7 +1582,7 @@ $('#run-detail-close').addEventListener('click', () => $('#run-dialog').close())
 // ---------- 设备保养 ----------
 
 function renderDevices() {
-  const devs = state.devices || [];
+  const devs = overview.devices || [];
   // 已知设备编号下拉提示（供上限设置与保养登记两个表单共用）
   $('#known-devices').innerHTML = devs
     .map((d) => `<option value="${escapeHtml(d.deviceNo)}">`)
@@ -1439,14 +1641,8 @@ function calibrationCell(c) {
     `${escapeHtml(c.calibNo)}<br>至 ${c.expiresAt}</div>`;
 }
 
-function renderMaintenances() {
-  const box = $('#maint-list');
-  const list = state.maintenances || [];
-  if (list.length === 0) {
-    box.innerHTML = '<div class="muted">暂无保养记录。</div>';
-    return;
-  }
-  box.innerHTML = `<div class="table-wrap"><table class="res-table">
+function maintenancesContent(list) {
+  return `<div class="table-wrap"><table class="res-table">
     <thead><tr>
       <th>保养单号</th><th>设备编号</th><th>原因</th><th>登记时间（UTC，新周期起点）</th>
     </tr></thead><tbody>${list
@@ -1520,14 +1716,8 @@ const CALIB_PHASE_LABEL = {
   expired: '<span class="badge bad">⏱ 合格但已到期</span>',
 };
 
-function renderCalibrations() {
-  const box = $('#calib-list');
-  const list = state.calibrations || [];
-  if (list.length === 0) {
-    box.innerHTML = '<div class="muted">暂无校准记录。</div>';
-    return;
-  }
-  box.innerHTML = `<div class="table-wrap"><table class="res-table">
+function calibrationsContent(list) {
+  return `<div class="table-wrap"><table class="res-table">
     <thead><tr>
       <th>校准单号</th><th>设备编号</th><th>结论</th><th>校准时间（UTC）</th>
       <th>到期时间（UTC）</th><th>状态</th>
@@ -1574,4 +1764,7 @@ $('#calib-submit').addEventListener('click', async () => {
 
 // ---------- 启动 ----------
 
+// 首屏先渲染各历史区块的「读取中」占位（配置/表单等待 overview 返回后渲染），
+// 再只取一次概览（当前配置、可执行状态、各区块首个有界页）。
+for (const name of SECTION_NAMES) renderSection(name);
 refresh().catch((e) => showAlert('初始化失败：' + e.message, 'err'));

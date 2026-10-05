@@ -1156,6 +1156,85 @@ export function listBookingRows(db) {
   return db.prepare('SELECT * FROM bookings ORDER BY id DESC').all();
 }
 
+// ---------- 工作台有界历史分页（稳定顺序：id DESC） ----------
+//
+// 首屏与每次写入后工作台只取各区块的首个有界页；查看旧记录时按稳定顺序逐页取回。
+// 统一以自增 id 倒序（最新记录在前）作为稳定顺序；游标携带「本轮锚点 anchorId」：
+// 一轮翻页从首页（不带游标）开始，首页确定锚点为当时的最大 id，之后每页都只取
+// id <= anchorId 的记录——同一轮翻页期间即使插入新记录（id 更大），本轮开始前已有
+// 记录也不会重复或遗漏；下一轮重新取首页时锚点前移，新记录随之可见。
+// 核验/预约列表连发布表取冻结依据哈希（与既有全量列表相同的 JOIN）。
+export const WORKBENCH_SECTIONS = {
+  publications: {
+    from: 'publications',
+    orderBy: 'id DESC',
+  },
+  verifications: {
+    from: `verifications v
+           JOIN publications p ON p.id = v.publication_id`,
+    select: 'v.*, p.basis_hash AS pub_basis_hash, p.feasible AS pub_feasible',
+    idColumn: 'v.id',
+    orderBy: 'v.id DESC',
+  },
+  reservations: {
+    from: `reservations r
+           JOIN publications p ON p.id = r.publication_id`,
+    select: 'r.*, p.basis_hash AS pub_basis_hash, p.feasible AS pub_feasible',
+    idColumn: 'r.id',
+    orderBy: 'r.id DESC',
+  },
+  suspensions: {
+    from: 'suspensions',
+    orderBy: 'id DESC',
+  },
+  runs: {
+    from: 'runs',
+    orderBy: 'id DESC',
+  },
+  maintenances: {
+    from: 'maintenances',
+    orderBy: 'id DESC',
+  },
+  calibrations: {
+    from: 'calibrations',
+    orderBy: 'id DESC',
+  },
+};
+
+export function workbenchMaxId(db, section) {
+  const spec = WORKBENCH_SECTIONS[section];
+  if (!spec) throw new Error(`未知工作台区块：${section}`);
+  const idColumn = spec.idColumn || 'id';
+  const row = db.prepare(`SELECT MAX(${idColumn}) AS maxId FROM ${spec.from}`).get();
+  return row.maxId ?? null;
+}
+
+// 取一个有界页（调用方传入 fetchLimit，一般为 limit+1，用于精确判断是否还有下一页）：
+// - 首页（anchorId 为 null）：从最新记录开始取，锚点由调用方用同表 MAX(id) 单独确定；
+// - 后续页（afterId 为上一页最末条 id）：取 id < afterId 且 id <= anchorId 的下一批。
+// 返回原始行（SELECT *），由 server 复用各区块既有视图函数按读取时现状序列化。
+export function workbenchPageRows(db, section, { fetchLimit, anchorId, afterId }) {
+  const spec = WORKBENCH_SECTIONS[section];
+  if (!spec) throw new Error(`未知工作台区块：${section}`);
+  const idColumn = spec.idColumn || 'id';
+  const where = [];
+  const params = [];
+  if (anchorId != null) {
+    where.push(`${idColumn} <= ?`);
+    params.push(anchorId);
+  }
+  if (afterId != null) {
+    where.push(`${idColumn} < ?`);
+    params.push(afterId);
+  }
+  const sql = `
+    SELECT ${spec.select || '*'} FROM ${spec.from}
+    ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+    ORDER BY ${spec.orderBy}
+    LIMIT ${fetchLimit}`;
+  return db.prepare(sql).all(...params);
+}
+
 // 写入整次操作的冻结记录（请求与当选结果快照；预约与排班已在同事务内生成）。
 export function insertBooking(db, b) {
   const info = db
